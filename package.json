@@ -1,0 +1,16 @@
+{
+  "name": "extras-account",
+  "version": "0.1.0",
+  "private": true,
+  "description": "账号系统开发工程",
+  "type": "module",
+  "engines": { "node": ">=20.6.0" },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "start:env": "node --env-file=.env src/index.js",
+    "dev:env": "node --env-file=.env --watch src/index.js",
+    "test": "node --test",
+    "check": "node --check src/index.js && node --check src/server.js"
+  }
+}
