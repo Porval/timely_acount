@@ -4,3 +4,4 @@ data/
 coverage/
 *.log
 .DS_Store
+/.local-run/

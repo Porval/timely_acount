@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>及时达 · 账户管理</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body>
+<div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+<main id="login-view" class="login-layout">
+  <section class="intro"><a class="brand" href="/">T<span>及时达</span></a><div class="intro-copy"><p class="eyebrow">ACCOUNT WORKSPACE</p><h1>连接服务商，<br>让协作更简单。</h1><p>统一管理服务商与人员账户，<br>用手机号安全访问你的工作空间。</p><div class="intro-tags"><span>手机号验证</span><span>单账户单会话</span><span>7 天登录有效期</span></div></div><p class="intro-footer">及时达 · 账户管理系统</p></section>
+  <section class="login-panel"><div class="login-card"><p class="eyebrow muted">WELCOME BACK</p><h2>登录管理后台</h2><p class="subtitle">使用账户绑定的手机号获取验证码</p>
+    <form id="login-form"><label for="login-mobile">手机号</label><input id="login-mobile" name="mobile" type="tel" inputmode="numeric" autocomplete="tel" maxlength="11" pattern="1[3-9][0-9]{9}" placeholder="请输入 11 位手机号" required>
+    <label for="login-code">短信验证码</label><div class="code-row"><input id="login-code" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" placeholder="请输入 6 位验证码" required><button id="send-code" type="button" class="secondary">获取验证码</button></div>
+    <p id="login-message" class="form-message" role="status" aria-live="polite"></p><button id="login-submit" class="primary full" type="submit">登录后台 <span aria-hidden="true">→</span></button></form>
+    <div id="development-note" class="dev-note" hidden>本地开发模式 · 验证码不会发送到真实手机<br><span id="development-code">演示手机号：13800138000</span></div>
+    <p class="login-tip">账户由管理员添加。新设备登录后，原设备将自动退出。</p>
+  </div></section>
+</main>
+<div id="workspace" class="workspace" hidden>
+  <aside class="sidebar"><a class="brand dark" href="/">T<span>及时达</span></a><p class="sidebar-caption">工作空间</p><div class="nav-item"><span aria-hidden="true">▦</span><span id="nav-label">账户管理</span></div><div class="sidebar-bottom"><span class="status-dot"></span>手机号验证登录<br><small>每个账户仅保留一个有效会话</small></div></aside>
+  <main class="main"><header class="topbar"><span>账户工作台</span><div class="user-bar"><span id="current-name"></span><span id="current-role" class="badge"></span><button id="logout" class="text-button">退出登录</button></div></header>
+  <section class="content"><div class="page-heading"><div><p class="eyebrow muted">ACCOUNTS</p><h1 id="page-title">账户管理</h1><p id="page-subtitle">管理服务商与人员信息，维护后台访问权限。</p></div><button id="add-account" class="primary">＋ 新增账户</button></div>
+    <div id="admin-view"><div class="stats"><article><span>账户总数</span><strong id="total-count">0</strong><small>已建立的账户档案</small></article><article><span>启用账户</span><strong id="enabled-count">0</strong><small>可通过手机号验证登录</small></article><article><span>服务商数量</span><strong id="provider-count">0</strong><small>当前账户所属服务商</small></article></div>
+    <section class="table-card"><div class="table-toolbar"><div><h2>账户列表</h2><p>手机号是账户的唯一登录标识</p></div><div class="filters"><input id="search" type="search" aria-label="搜索账户" placeholder="搜索服务商、人员或手机号"><select id="status-filter" aria-label="筛选账户状态"><option value="all">全部状态</option><option value="enabled">已启用</option><option value="disabled">已停用</option></select></div></div>
+      <div class="table-scroll"><table><thead><tr><th>人员名称</th><th>服务商名称</th><th>手机号</th><th>权限</th><th>状态</th><th>操作</th></tr></thead><tbody id="account-rows"></tbody></table></div><p id="empty-state" class="empty" hidden>暂无匹配账户</p><div class="table-footer"><span id="table-count"></span><span>修改手机号或权限后，需要重新登录</span></div></section></div>
+    <section id="member-view" class="table-card profile" hidden><h2>我的账户信息</h2><dl id="profile-fields"></dl><p class="subtitle">信息变更请联系管理员。</p></section>
+    <p class="session-note">单账户单会话 <span>·</span> 登录有效至 <time id="session-expiry"></time></p>
+  </section></main>
+</div>
+<dialog id="account-dialog"><form id="account-form"><div class="dialog-heading"><div><p class="eyebrow muted">ACCOUNT DETAILS</p><h2 id="dialog-title">新增账户</h2></div><button id="dialog-close" type="button" class="close-button" aria-label="关闭">×</button></div><label for="provider-name">服务商名称</label><input id="provider-name" name="providerName" maxlength="80" placeholder="请输入服务商名称" required><label for="person-name">人员名称</label><input id="person-name" name="personName" maxlength="80" placeholder="请输入人员名称" required><label for="account-mobile">手机号</label><input id="account-mobile" name="mobile" type="tel" inputmode="numeric" maxlength="11" pattern="1[3-9][0-9]{9}" placeholder="用于接收登录验证码" required><label for="account-role">后台权限</label><select id="account-role" name="role"><option value="member">普通成员 · 查看自己的信息</option><option value="admin">管理员 · 管理全部账户</option></select><p id="account-message" class="form-message" role="status" aria-live="polite"></p><div class="dialog-actions"><button id="dialog-cancel" type="button" class="secondary">取消</button><button id="account-save" type="submit" class="primary">保存账户</button></div></form></dialog>
+</body></html>
