@@ -11,7 +11,7 @@ export class OrderStore {
       );
       CREATE INDEX IF NOT EXISTS orders_owner ON orders(owner_id, created_at);
       CREATE TABLE IF NOT EXISTS payment_screenshots (
-        id TEXT PRIMARY KEY, order_id TEXT NOT NULL UNIQUE REFERENCES orders(id) ON DELETE CASCADE,
+        id TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
         content_type TEXT NOT NULL, sha256 TEXT NOT NULL, data BLOB NOT NULL CHECK(length(data) BETWEEN 1 AND 5242880), created_at INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS management_events (
@@ -27,6 +27,8 @@ export class OrderStore {
       );
     `);
     this.migrateOptionalReference();
+    this.migratePaymentScreenshots();
+    this.db.exec('CREATE INDEX IF NOT EXISTS payment_screenshots_order ON payment_screenshots(order_id)');
   }
   migrateOptionalReference() {
     if (!this.db.pragma('table_info(orders)').find(column => column.name === 'reference_id')?.notnull) return;
@@ -52,6 +54,26 @@ export class OrderStore {
     } finally {
       this.db.pragma(`foreign_keys = ${foreignKeys ? 'ON' : 'OFF'}`);
     }
+  }
+  migratePaymentScreenshots() {
+    const indexes = this.db.prepare('SELECT name FROM pragma_index_list(?) WHERE "unique"=1').all('payment_screenshots');
+    const uniqueByOrder = indexes.some(index => {
+      const columns = this.db.prepare('SELECT name FROM pragma_index_info(?)').all(index.name);
+      return columns.length === 1 && columns[0].name === 'order_id';
+    });
+    if (!uniqueByOrder) return;
+    this.transaction(() => {
+      this.db.exec(`
+        CREATE TABLE payment_screenshots_multiple (
+          id TEXT PRIMARY KEY, order_id TEXT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+          content_type TEXT NOT NULL, sha256 TEXT NOT NULL, data BLOB NOT NULL CHECK(length(data) BETWEEN 1 AND 5242880), created_at INTEGER NOT NULL
+        );
+        INSERT INTO payment_screenshots_multiple SELECT * FROM payment_screenshots;
+        DROP TABLE payment_screenshots;
+        ALTER TABLE payment_screenshots_multiple RENAME TO payment_screenshots;
+      `);
+      if (this.db.pragma('foreign_key_check').length) throw new Error('付款截图迁移后关联校验失败');
+    });
   }
   transaction(fn) {
     this.db.exec('BEGIN IMMEDIATE');

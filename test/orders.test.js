@@ -253,3 +253,145 @@ test('审核建单后立即同步首份配送快照，不依赖页面打开详�
   for(let index=0;index<50&&!f.orders.get(order.id).fulfillment.syncedAt;index++)await new Promise(resolve=>setTimeout(resolve,10));
   const saved=f.orders.get(order.id);assert.equal(saved.external.timelyOrderId,'auto-linked');assert.equal(saved.fulfillment.memos[0].content,'履约方已接单');assert.equal(creates,1);assert.equal(queries,1);
 });
+
+
+test('退回付款资料必填原因并幂等保留凭证、拒绝快照和事件，不进入审核履约',async t=>{
+  const f=await fixture(t),order=(await f.create()).data.order;
+  const paymentPath=`/api/orders/${order.id}/manual-payment`,managerPath=`/api/order-management/orders/${order.id}`;
+  const first=(await f.call(paymentPath,{method:'POST',cookie:f.cookie,body:{reference:'PROOF-A',description:'转账资料',screenshot}})).data.order.payment;
+  const rejection={eventId:'reject-A',noteId:first.noteId,reason:'截图中的收款方需要核对',reviewerName:'收款人员',rejectedAt:Date.now()};
+  assert.equal((await f.call(`${managerPath}/reject-payment`,{method:'POST',management:true,body:{...rejection,reason:'  '}})).status,400);
+  const rejected=await f.call(`${managerPath}/reject-payment`,{method:'POST',management:true,body:rejection});
+  assert.equal(rejected.status,200);assert.equal(rejected.data.replayed,false);
+  const saved=rejected.data.order;assert.equal(saved.payment.status,'unpaid');assert.equal(saved.review.status,'not_submitted');assert.equal(saved.external.status,'not_created');
+  assert.deepEqual(saved.payment.rejection,{noteId:first.noteId,reason:rejection.reason,reviewerName:rejection.reviewerName,rejectedAt:rejection.rejectedAt});
+  assert.deepEqual(saved.payment.rejections[0],{...saved.payment.rejection,reference:first.reference,description:first.description,screenshot:first.screenshot,submittedAt:first.submittedAt,payerId:first.payerId,payerName:first.payerName});
+  const events=saved.events.length;
+  const replay=await f.call(`${managerPath}/reject-payment`,{method:'POST',management:true,body:rejection});assert.equal(replay.data.replayed,true);assert.equal(replay.data.order.events.length,events);
+  assert.equal((await f.call(`${managerPath}/reject-payment`,{method:'POST',management:true,body:{...rejection,reason:'不同原因'}})).status,409);
+  assert.equal((await f.call(`${managerPath}/reject-payment`,{method:'POST',management:true,body:{...rejection,eventId:'second-decision'}})).status,409);
+  assert.equal((await f.call(`${managerPath}/review`,{method:'POST',management:true,body:{eventId:'review-unpaid',status:'approved',reviewerName:'审核人',reviewedAt:Date.now()}})).status,409);
+  assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM fulfillment_jobs').get().n,0);
+  assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM management_events').get().n,1);
+  assert.deepEqual(f.orders.getPaymentScreenshot(order.id,f.owner.id).data,Buffer.from(screenshot.data,'base64'));
+  const reopened=new SQLiteStore(f.store.path);t.after(()=>reopened.close());assert.deepEqual(new OrderService(reopened).get(order.id).payment,saved.payment);
+});
+
+test('退回接口保持管理鉴权和账号隔离，版本、时间和输入无效时不改变数据',async t=>{
+  const f=await fixture(t),order=(await f.create()).data.order;
+  const first=f.orders.submitManualPayment(order.id,f.owner,{reference:'AUTH-PROOF',description:'',screenshot}).order.payment;
+  const path=`/api/order-management/orders/${order.id}/reject-payment`;
+  const valid={eventId:'reject-auth',noteId:first.noteId,reason:'需要补全信息',reviewerName:'核对人',rejectedAt:Date.now()};
+  const otherCookie=await f.login(f.other);
+  for(const options of [{},{cookie:f.cookie},{cookie:otherCookie},{management:true,key:'incorrect'}]) assert.equal((await f.call(path,{method:'POST',body:valid,...options})).status,401);
+  assert.equal((await f.call(`/api/orders/${order.id}/manual-payment`,{method:'POST',cookie:otherCookie,body:{reference:'FOREIGN',screenshot}})).status,404);
+  assert.equal((await f.call(`/api/orders/${order.id}`,{cookie:otherCookie})).status,404);
+  assert.equal((await fetch(f.base+`/api/orders/${order.id}/payment-screenshot`,{headers:{Cookie:otherCookie}})).status,404);
+  assert.equal((await f.call('/api/order-management/orders/missing/reject-payment',{method:'POST',management:true,body:valid})).status,404);
+  for(const change of [{noteId:undefined},{reason:''},{reviewerName:''},{rejectedAt:0},{rejectedAt:Date.now()+600000}]) assert.equal((await f.call(path,{method:'POST',management:true,body:{...valid,...change}})).status,400);
+  for(const change of [{noteId:'another-submission'},{rejectedAt:first.submittedAt-1}]) assert.equal((await f.call(path,{method:'POST',management:true,body:{...valid,...change}})).status,409);
+  const second=(await f.create({...input(),referenceId:'AUTH-SECOND'},'auth-second')).data.order;
+  assert.equal((await f.call(`/api/order-management/orders/${second.id}/reject-payment`,{method:'POST',management:true,body:valid})).status,409);
+  assert.deepEqual(f.orders.get(order.id).payment,first);assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM management_events').get().n,0);
+});
+
+test('退回后重提需匹配previousNoteId，旧提交与旧退回重放不能覆盖新资料，同图也可重提',async t=>{
+  const f=await fixture(t),order=(await f.create()).data.order,body={reference:'SAME-PROOF',description:'重新核对原图',screenshot};
+  const path=`/api/orders/${order.id}/manual-payment`,rejectPath=`/api/order-management/orders/${order.id}/reject-payment`;
+  const send=payload=>f.call(path,{method:'POST',cookie:f.cookie,body:payload});
+  const first=(await send(body)).data.order.payment;
+  assert.equal((await send(body)).data.replayed,true);
+  const rejectA={eventId:'version-reject-A',noteId:first.noteId,reason:'核对付款人',reviewerName:'核对人',rejectedAt:Date.now()};
+  assert.equal((await f.call(rejectPath,{method:'POST',management:true,body:rejectA})).status,200);
+  for(const payload of [body,{...body,previousNoteId:'stale'}]) assert.equal((await send(payload)).status,409);
+  await new Promise(resolve=>setTimeout(resolve,2));
+  const secondResult=await send({...body,previousNoteId:first.noteId});assert.equal(secondResult.status,200);
+  const second=secondResult.data.order.payment;assert.equal(secondResult.data.replayed,false);assert.notEqual(second.noteId,first.noteId);assert.ok(second.submittedAt>first.submittedAt);
+  assert.equal(second.previousNoteId,first.noteId);assert.equal(second.rejection,undefined);assert.equal(second.rejections.length,1);
+  assert.equal((await send({...body,previousNoteId:first.noteId})).data.replayed,true);
+  for(const payload of [body,{...body,previousNoteId:second.noteId},{...body,previousNoteId:first.noteId,description:'不同内容'}]) assert.equal((await send(payload)).status,409);
+  const replayA=await f.call(rejectPath,{method:'POST',management:true,body:rejectA});assert.equal(replayA.data.replayed,true);assert.equal(replayA.data.order.payment.noteId,second.noteId);assert.equal(replayA.data.order.payment.status,'submitted');
+  const rejectB={...rejectA,eventId:'version-reject-B',noteId:second.noteId,rejectedAt:Date.now()};
+  assert.equal((await f.call(rejectPath,{method:'POST',management:true,body:rejectB})).status,200);
+  assert.equal((await send({...body,previousNoteId:first.noteId})).status,409);
+  const third=(await send({...body,previousNoteId:second.noteId})).data.order.payment;assert.notEqual(third.noteId,second.noteId);assert.equal(third.rejections.length,2);
+  assert.deepEqual(third.rejections.map(x=>x.noteId),[first.noteId,second.noteId]);
+  assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM payment_screenshots WHERE order_id=?').get(order.id).n,3);
+  assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM fulfillment_jobs').get().n,0);
+});
+
+test('退回后的陈旧确认和拒绝均被阻止，正确轮次确认幂等且只进入收款待审核',async t=>{
+  const f=await fixture(t),order=(await f.create()).data.order,path=`/api/order-management/orders/${order.id}`;
+  const first=f.orders.submitManualPayment(order.id,f.owner,{reference:'PROOF-FIRST',description:'初次',screenshot}).order.payment;
+  const receipt={eventId:'stale-receipt',noteId:first.noteId,transactionId:'FINAL-TX',amount:2468,collectedAt:Date.now()};
+  f.orders.rejectPayment(order.id,{eventId:'stale-reject-A',noteId:first.noteId,reason:'请补全信息',reviewerName:'核对人',rejectedAt:Date.now()});
+  assert.equal((await f.call(`${path}/receipt`,{method:'POST',management:true,body:receipt})).status,409);
+  assert.equal((await f.call(`${path}/receipt`,{method:'POST',management:true,body:{...receipt,noteId:undefined}})).status,409);
+  await new Promise(resolve=>setTimeout(resolve,2));
+  const replacement={...screenshot,data:Buffer.concat([Buffer.from(screenshot.data,'base64'),Buffer.from('replacement-proof')]).toString('base64')};
+  const second=f.orders.submitManualPayment(order.id,f.owner,{reference:'PROOF-SECOND',description:'补全资料',screenshot:replacement,previousNoteId:first.noteId}).order.payment;
+  assert.notEqual(second.screenshot.id,first.screenshot.id);
+  assert.deepEqual(f.orders.getPaymentScreenshot(order.id,f.owner.id).data,Buffer.from(replacement.data,'base64'));
+  const managerImage=await fetch(f.base+`${path}/payment-screenshot`,{headers:{Authorization:`Bearer ${token}`}});assert.deepEqual(Buffer.from(await managerImage.arrayBuffer()),Buffer.from(replacement.data,'base64'));
+  assert.deepEqual(f.store.db.prepare('SELECT data FROM payment_screenshots WHERE id=?').get(first.screenshot.id).data,Buffer.from(screenshot.data,'base64'));
+  for(const change of [{},{noteId:undefined}]) assert.equal((await f.call(`${path}/receipt`,{method:'POST',management:true,body:{...receipt,...change}})).status,409);
+  assert.equal((await f.call(`${path}/reject-payment`,{method:'POST',management:true,body:{eventId:'old-decision-new-event',noteId:first.noteId,reason:'陈旧页面',reviewerName:'核对人',rejectedAt:Date.now()}})).status,409);
+  const confirmed={...receipt,noteId:second.noteId,collectedAt:second.submittedAt-60000};
+  assert.equal((await f.call(`${path}/receipt`,{method:'POST',management:true,body:confirmed})).status,200);
+  assert.equal((await f.call(`${path}/receipt`,{method:'POST',management:true,body:confirmed})).data.replayed,true);
+  assert.equal((await f.call(`${path}/receipt`,{method:'POST',management:true,body:{...confirmed,noteId:first.noteId}})).status,409);
+  assert.equal((await f.call(`${path}/reject-payment`,{method:'POST',management:true,body:{eventId:'reject-paid',noteId:second.noteId,reason:'不能退回已收款',reviewerName:'核对人',rejectedAt:Date.now()}})).status,409);
+  const saved=f.orders.get(order.id);assert.equal(saved.payment.status,'paid');assert.equal(saved.review.status,'pending');assert.equal(saved.payment.rejections.length,1);assert.equal(saved.external.status,'not_created');
+  assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM fulfillment_jobs').get().n,0);
+});
+
+test('确认与退回同一付款资料并发时只有一个决策成功，不会产生履约任务',async t=>{
+  const f=await fixture(t);
+  for(const rejectFirst of [false,true]) {
+    const order=(await f.create({...input(),referenceId:`RACE-${rejectFirst}`},`race-${rejectFirst}`)).data.order;
+    const proof=f.orders.submitManualPayment(order.id,f.owner,{reference:'RACE',description:'',screenshot}).order.payment;
+    const base=`/api/order-management/orders/${order.id}`,time=Date.now();
+    const calls=[()=>f.call(`${base}/receipt`,{method:'POST',management:true,body:{eventId:`race-confirm-${rejectFirst}`,noteId:proof.noteId,transactionId:`RACE-TX-${rejectFirst}`,amount:2468,collectedAt:time}}),()=>f.call(`${base}/reject-payment`,{method:'POST',management:true,body:{eventId:`race-reject-${rejectFirst}`,noteId:proof.noteId,reason:'资料有误',reviewerName:'核对人',rejectedAt:time}})];
+    if(rejectFirst) calls.reverse();
+    const results=await Promise.all(calls.map(run=>run()));assert.deepEqual(results.map(x=>x.status).sort(),[200,409]);
+    const saved=f.orders.get(order.id);assert.ok(['paid','unpaid'].includes(saved.payment.status));
+    assert.equal(saved.review.status,saved.payment.status==='paid'?'pending':'not_submitted');
+    assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM management_events WHERE order_id=?').get(order.id).n,1);
+    assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM fulfillment_jobs WHERE order_id=?').get(order.id).n,0);
+  }
+});
+
+test('旧补图保持本轮noteId和提交时间，未退回旧收款接口兼容但可选noteId仍校验',async t=>{
+  const f=await fixture(t),order=(await f.create()).data.order,submittedAt=Date.now()-1000;
+  order.payment={status:'submitted',noteId:'legacy-payment',reference:'LEGACY-PROOF',description:'',submittedAt};f.orders.store.write(order,Date.now());
+  const supplemented=f.orders.submitManualPayment(order.id,f.owner,{reference:'LEGACY-PROOF',description:'',screenshot}).order.payment;
+  assert.equal(supplemented.noteId,'legacy-payment');assert.equal(supplemented.submittedAt,submittedAt);
+  const receipt={eventId:'legacy-receipt',transactionId:'LEGACY-TX',amount:2468,collectedAt:Date.now()};
+  assert.throws(()=>f.orders.receipt(order.id,{...receipt,noteId:'other'}),/付款资料已更新/);
+  assert.equal(f.orders.receipt(order.id,receipt).order.payment.status,'paid');assert.equal(f.orders.receipt(order.id,receipt).replayed,true);
+  const second=(await f.create({...input(),referenceId:'LEGACY-UNPAID'},'legacy-unpaid')).data.order;
+  assert.equal(f.orders.receipt(second.id,{...receipt,eventId:'legacy-direct',transactionId:'LEGACY-DIRECT'}).order.payment.status,'paid');
+});
+
+test('旧一单一图迁移保留BLOB和审计，允许一单多次提交，重复迁移安全且约束仍在',t=>{
+  const dir=mkdtempSync(join(tmpdir(),'payment-history-migration-')),path=join(dir,'accounts.sqlite');let store=new SQLiteStore(path);
+  t.after(()=>{store.close();rmSync(dir,{recursive:true,force:true})});
+  let orders=new OrderService(store);const owner={id:'migration-owner',providerName:'测试',personName:'测试人'};
+  const created=orders.create(owner,input(),'migration-create').order;
+  store.db.exec(`DROP TABLE payment_screenshots; CREATE TABLE payment_screenshots (id TEXT PRIMARY KEY, order_id TEXT NOT NULL UNIQUE REFERENCES orders(id) ON DELETE CASCADE, content_type TEXT NOT NULL, sha256 TEXT NOT NULL, data BLOB NOT NULL CHECK(length(data) BETWEEN 1 AND 5242880), created_at INTEGER NOT NULL);`);
+  const first=orders.submitManualPayment(created.id,owner,{reference:'MIGRATION-PROOF',description:'保留原图',screenshot}).order.payment;
+  const original=store.db.prepare('SELECT * FROM payment_screenshots').get(),data=orders.get(created.id);
+  store.db.prepare('INSERT INTO management_events VALUES(?,?,?,?,?)').run('historical-audit',created.id,'audit','historical-hash',1);
+  store.close();store=new SQLiteStore(path);orders=new OrderService(store);
+  assert.deepEqual(orders.get(created.id),data);assert.deepEqual(store.db.prepare('SELECT * FROM payment_screenshots').get(),original);
+  assert.equal(store.db.prepare('SELECT payload_hash FROM management_events').get().payload_hash,'historical-hash');
+  assert.equal(store.db.pragma('foreign_key_check').length,0);assert.equal(store.db.pragma('foreign_keys',{simple:true}),1);
+  orders.rejectPayment(created.id,{eventId:'migration-reject',noteId:first.noteId,reason:'重新确认',reviewerName:'核对人',rejectedAt:Date.now()});
+  const second=orders.submitManualPayment(created.id,owner,{reference:'MIGRATION-PROOF',description:'保留原图',screenshot,previousNoteId:first.noteId}).order.payment;
+  assert.notEqual(second.screenshot.id,first.screenshot.id);assert.equal(store.db.prepare('SELECT count(*) AS n FROM payment_screenshots').get().n,2);
+  assert.deepEqual(orders.getPaymentScreenshot(created.id,owner.id).data,original.data);
+  assert.throws(()=>store.db.prepare('INSERT INTO payment_screenshots VALUES(?,?,?,?,?,?)').run('empty',created.id,'image/png','hash',Buffer.alloc(0),1),/CHECK/);
+  assert.throws(()=>store.db.prepare('INSERT INTO payment_screenshots VALUES(?,?,?,?,?,?)').run('foreign','missing','image/png','hash',original.data,1),/FOREIGN KEY/);
+  assert.throws(()=>store.db.prepare('INSERT INTO payment_screenshots VALUES(?,?,?,?,?,?)').run(first.screenshot.id,created.id,'image/png','hash',original.data,1),/UNIQUE/);
+  new OrderService(store);assert.equal(store.db.prepare('SELECT count(*) AS n FROM payment_screenshots').get().n,2);assert.equal(store.db.pragma('foreign_key_check').length,0);
+});

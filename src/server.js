@@ -121,7 +121,7 @@ export function createApp({ config = loadConfig(), store = new SQLiteStore(confi
           if (request.method === 'PATCH' && accountMatch) return json(response, 200, channels.updateAccount(accountMatch[1], await body(request)));
           throw new AppError(404, '渠道管理接口不存在');
         }
-        const match = path.match(/^\/api\/order-management\/orders\/([^/]+)(?:\/(receipt|review|fulfillment|link|payment-screenshot))?$/);
+        const match = path.match(/^\/api\/order-management\/orders\/([^/]+)(?:\/(receipt|reject-payment|review|fulfillment|link|payment-screenshot))?$/);
         if (request.method === 'GET' && path === '/api/order-management/orders') return json(response, 200, orders.list(null, Object.fromEntries(url.searchParams)));
         if (match && request.method === 'GET' && match[2] === 'payment-screenshot') return sendScreenshot(response, orders.getPaymentScreenshot(match[1]));
         if (match && request.method === 'GET' && !match[2]) {
@@ -129,8 +129,9 @@ export function createApp({ config = loadConfig(), store = new SQLiteStore(confi
           order = await synchronizer.refresh(order.id);
           return json(response, 200, { order });
         }
-        if (match && request.method === 'POST' && ['receipt','review','fulfillment','link'].includes(match[2])) {
-          const result = orders[match[2]](match[1], await body(request, 65536));
+        if (match && request.method === 'POST' && ['receipt','reject-payment','review','fulfillment','link'].includes(match[2])) {
+          const action = match[2] === 'reject-payment' ? 'rejectPayment' : match[2];
+          const result = orders[action](match[1], await body(request, 65536));
           if (match[2] === 'review') queueMicrotask(() => dispatcher.runOnce());
           return json(response, 200, result);
         }

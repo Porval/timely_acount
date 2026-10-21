@@ -101,25 +101,49 @@ export class OrderService {
   }
   getPaymentScreenshot(id, ownerId) {
     const order = this.get(id, ownerId);
-    const screenshot = this.db.prepare('SELECT * FROM payment_screenshots WHERE order_id=?').get(id);
-    if (!screenshot || screenshot.id !== order.payment.screenshot?.id) fail(404, '付款截图不存在');
+    const screenshot = this.db.prepare('SELECT * FROM payment_screenshots WHERE id=? AND order_id=?').get(order.payment.screenshot?.id || '', id);
+    if (!screenshot) fail(404, '付款截图不存在');
     return screenshot;
   }
   submitManualPayment(id, account, input) {
     const payload = { reference: text(input.reference, '付款流水号', 120), description: text(input.description, '付款说明', 1000, true) };
+    const previousNoteId = input.previousNoteId === undefined ? undefined : text(input.previousNoteId, 'previousNoteId', 120);
     return this.store.transaction(() => {
       const order = this.get(id, account.id);
       if (order.payment.status === 'paid') fail(409, '已确认收款，不能重复提交付款信息');
+      const hasRejections = Boolean(order.payment.rejections?.length);
+      if (hasRejections) {
+        const expected = order.payment.status === 'submitted' ? order.payment.previousNoteId : order.payment.noteId;
+        if (!previousNoteId || previousNoteId !== expected) fail(409, '付款资料已更新，请刷新订单后重新提交');
+      } else if (previousNoteId !== undefined) fail(409, '付款资料版本不匹配，请刷新订单后重新提交');
       const image = parseScreenshot(input.screenshot);
       if (order.payment.status === 'submitted' && (order.payment.reference !== payload.reference || order.payment.description !== payload.description || (order.payment.screenshot && order.payment.screenshot.sha256 !== image.sha256))) fail(409, '已提交付款信息，等待管理端核对');
       if (order.payment.status === 'submitted' && order.payment.screenshot) return { order, replayed: true };
-      const screenshot = {id:randomUUID(),contentType:image.contentType,size:image.size,sha256:image.sha256,uploadedAt:this.now()};
-      this.db.prepare('INSERT INTO payment_screenshots(id,order_id,content_type,sha256,data,created_at) VALUES(?,?,?,?,?,?)').run(screenshot.id,id,image.contentType,image.sha256,image.data,this.now());
+      const now = this.now();
+      const screenshot = {id:randomUUID(),contentType:image.contentType,size:image.size,sha256:image.sha256,uploadedAt:now};
+      this.db.prepare('INSERT INTO payment_screenshots(id,order_id,content_type,sha256,data,created_at) VALUES(?,?,?,?,?,?)').run(screenshot.id,id,image.contentType,image.sha256,image.data,now);
       const supplement = order.payment.status === 'submitted';
-      order.payment = { ...order.payment, status: 'submitted', noteId: order.payment.noteId || randomUUID(), ...payload, screenshot, submittedAt: order.payment.submittedAt || this.now(), payerId: account.id, payerName: account.personName };
-      this.event(order, supplement ? '补充付款截图' : '提交手动付款信息', `${account.personName} 提交付款流水和截图，等待管理端核对到账。`);
-      this.store.write(order, this.now());
+      order.payment = { ...order.payment, status: 'submitted', noteId: supplement ? order.payment.noteId || randomUUID() : randomUUID(), ...payload, screenshot,
+        submittedAt: supplement ? order.payment.submittedAt || now : now, payerId: account.id, payerName: account.personName,
+        ...(hasRejections ? { previousNoteId } : {}) };
+      delete order.payment.rejection;
+      this.event(order, supplement ? '补充付款截图' : hasRejections ? '重新提交付款资料' : '提交手动付款信息', `${account.personName} 提交付款流水和截图，等待管理端核对到账。`);
+      this.store.write(order, now);
       return { order, replayed: false };
+    });
+  }
+  rejectPayment(id, input) {
+    const payload = { noteId: text(input.noteId, '付款资料编号', 120), reason: text(input.reason, '退回原因', 1000),
+      reviewerName: text(input.reviewerName, '核对人员', 80), rejectedAt: this.timestamp(input.rejectedAt, '退回时间') };
+    return this.receive(id, 'reject-payment', input.eventId, payload, order => {
+      if (order.payment.status !== 'submitted' || order.payment.noteId !== payload.noteId) fail(409, '付款资料已更新或不在待收款确认状态，请刷新订单');
+      if (payload.rejectedAt < order.payment.submittedAt) fail(409, '退回时间不能早于付款资料提交时间');
+      if (order.review.status !== 'not_submitted' || order.external.status !== 'not_created') fail(409, '订单已经进入收款审核流程，不能退回付款资料');
+      const previous = order.payment;
+      const rejected = { ...payload, reference: previous.reference, description: previous.description, screenshot: previous.screenshot,
+        submittedAt: previous.submittedAt, payerId: previous.payerId, payerName: previous.payerName };
+      order.payment = { ...previous, status: 'unpaid', rejection: payload, rejections: [...(previous.rejections || []), rejected] };
+      this.event(order, '付款资料已退回', `${payload.reviewerName}：${payload.reason}`);
     });
   }
   timestamp(value, label) { return integer(value, label, 1, this.now() + 300000); }
@@ -140,8 +164,10 @@ export class OrderService {
   }
   receipt(id, input) {
     const payload = { transactionId: text(input.transactionId, '收款流水号', 120), amount: integer(input.amount, '收款金额（分）', 1, 99999999),
-      collectedAt: this.timestamp(input.collectedAt, '收款时间') };
+      collectedAt: this.timestamp(input.collectedAt, '收款时间'), ...(input.noteId === undefined ? {} : { noteId: text(input.noteId, '付款资料编号', 120) }) };
     return this.receive(id, 'receipt', input.eventId, payload, order => {
+      if (payload.noteId !== undefined && payload.noteId !== order.payment.noteId) fail(409, '付款资料已更新，请刷新订单后确认收款');
+      if (order.payment.rejections?.length && (order.payment.status !== 'submitted' || !payload.noteId)) fail(409, '退回后的付款资料必须重新提交，并核对本次付款资料编号');
       if (this.db.prepare("SELECT id FROM orders WHERE json_extract(data,'$.payment.transactionId')=? AND id<>?").get(payload.transactionId, order.id)) fail(409, '该收款流水已用于其他订单');
       if (payload.amount !== order.payPrice) fail(409, '实收金额与应付金额不一致');
       if (order.payment.status === 'paid') {

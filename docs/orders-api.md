@@ -2,7 +2,7 @@
 
 订单功能合并在 extrasAccount，继续使用同一登录身份和 SQLite 数据库。extrasWeb 是发起方页面，已有管理端由它自己的服务器调用下列管理接口；本项目不建设管理端页面，也不提供线上支付。
 
-业务流程：手工建单 → 提交手动付款信息 → 管理端确认收款 → 管理端审核 → 本后台调用履约接口建单 → Web 查看履约。
+业务流程：手工建单 → 提交手动付款信息 → 管理端确认收款（资料有误可退回重提）→ 管理端审核 → 本后台调用履约接口建单 → Web 查看履约。
 
 `order.id` 是本项目结算订单 ID，`referenceId` 是选填的外部订单号（省略或空字符串表示未填写），`external.timelyOrderId` 是审核通过后关联的履约订单 ID。所有本项目 API 金额均为整数分，时间均为 Unix 毫秒。
 
@@ -36,7 +36,7 @@
 提交手动付款信息：
 
 ```json
-{ "reference": "银行或支付平台流水号", "description": "手动付款说明" }
+{ "reference": "银行或支付平台流水号", "description": "手动付款说明", "screenshot": { "contentType": "image/png", "data": "原图纯base64内容" } }
 ```
 
 订单变为 `payment.status=submitted`，页面显示待收款确认。只有管理端可以确认收款和审核。
@@ -56,7 +56,8 @@ Content-Type: application/json
 | --- | --- | --- |
 | GET | `/api/order-management/orders` | 管理端查询订单；支持 `reviewStatus=pending` 与分页 |
 | GET | `/api/order-management/orders/:id` | 查询订单、付款信息和审核状态 |
-| POST | `/api/order-management/orders/:id/receipt` | 确认实际收款 |
+| POST | `/api/order-management/orders/:id/receipt` | 确认实际收款，建议始终携带当前 noteId |
+| POST | `/api/order-management/orders/:id/reject-payment` | 收款前退回付款资料，必须填写原因，可由原账号重新提交 |
 | POST | `/api/order-management/orders/:id/review` | 审核结果；通过后后台自动发起履约建单 |
 | POST | `/api/order-management/orders/:id/fulfillment` | 写入关联履约订单的状态 |
 | POST | `/api/order-management/orders/:id/link` | 建单结果未确认时，人工核对已有履约订单后关联，避免重复创建 |
@@ -66,10 +67,26 @@ Content-Type: application/json
 ### 1. 确认实际收款
 
 ```json
-{ "eventId": "receipt-20261008-001", "transactionId": "实际收款流水号", "amount": 2468, "collectedAt": 1791460800000 }
+{ "eventId": "receipt-20261008-001", "noteId": "当前 payment.noteId", "transactionId": "实际收款流水号", "amount": 2468, "collectedAt": 1791460800000 }
 ```
 
-金额必须等于订单应付金额，同一收款流水不能用于两个订单。收款后页面显示已收款待审核，此时不调用履约建单接口。
+金额必须等于订单应付金额，同一收款流水不能用于两个订单。`noteId` 提供时必须匹配当前付款资料，并参与事件内容幂等校验。经历过付款资料退回的订单，首次确认必须处于 `submitted` 且携带正确 `noteId`，避免陈旧页面确认新一轮付款；从未退回的旧集成可继续省略 `noteId`、直接确认未提交付款资料的订单。`collectedAt` 表示真实到账时间，可早于提交或重提资料时间，继续沿用原时间格式和未来时间校验。收款后页面显示已收款待审核，此时不调用履约建单接口。
+
+### 1.1 收款前退回付款资料
+
+```json
+{ "eventId": "reject-payment-001", "noteId": "当前 payment.noteId", "reason": "截图中的收款方需要核对", "reviewerName": "核对人员", "rejectedAt": 1791460800000 }
+```
+
+调用 `POST /api/order-management/orders/:id/reject-payment`。仅当前 `payment.status=submitted` 且 `noteId` 匹配时可操作；原因、核对人员和时间必填，`rejectedAt` 不能早于本轮 `submittedAt`。相同事件及内容重发返回 `replayed:true`，同事件不同内容或新事件引用旧轮次返回 409。确认收款与退回并发时，仅一个决策能够成功。
+
+退回后 `payment.status=unpaid`，`review.status` 仍为 `not_submitted`；这只是要求原建单账号重新确认付款资料，不确认到账、不发起退款，也不会建立履约任务。`payment.rejection` 返回当前退回的 `{noteId,reason,reviewerName,rejectedAt}`；`payment.rejections[]` 追加保留每轮被退回的流水、说明、截图元信息、提交时间、提交人和拒绝结果，进度事件保留操作记录。
+
+原账号重新提交 `POST /api/orders/:id/manual-payment` 时，必须额外提供 `previousNoteId`，等于刚被退回的 `payment.noteId`，其余付款字段和截图仍必填。可重新确认相同流水和原图，无需为了重提刻意修改内容。成功后生成新的 `noteId/submittedAt`，清除当前 `payment.rejection` 并保留完整 `rejections`，同时在本轮付款中保存 `previousNoteId`。网络重试必须保留相同 `previousNoteId` 和内容；待确认期间重复相同请求返回 `replayed:true`，旧轮次的提交、确认或退回请求不能改变新资料。初次提交、未退回旧订单补图仍可省略 `previousNoteId`；补图保留本轮已有的 `noteId/submittedAt`。
+
+```json
+{ "previousNoteId": "刚被退回的 payment.noteId", "reference": "付款流水号", "description": "付款说明", "screenshot": { "contentType": "image/png", "data": "原图纯base64内容" } }
+```
 
 ### 2. 审核
 
@@ -142,7 +159,7 @@ TIMELY_CREATOR_ID=实际创建人员ID
 
 ## 付款截图与标准商品库
 
-POST /api/orders/:id/manual-payment 新增必填 screenshot：{contentType: 'image/png', data: '原图文件的纯 base64 内容，不含 data: 前缀'}，支持 image/jpeg、image/png、image/webp，解码后单张最多 5 MB，请求体上限 8 MB。截图二进制存入同一 SQLite 的 payment_screenshots 表，与付款状态在同一事务提交。订单接口仅返回截图元信息；GET /api/orders/:id/payment-screenshot 仅允许订单所有者的有效会话读取。管理端使用 GET /api/order-management/orders/:id/payment-screenshot，必须持有原管理鉴权。图片响应为私有且禁止缓存。旧的已提交但无截图的订单可保留原流水和说明补充截图，提交后的截图不能替换。
+POST /api/orders/:id/manual-payment 新增必填 screenshot：{contentType: 'image/png', data: '原图文件的纯 base64 内容，不含 data: 前缀'}，支持 image/jpeg、image/png、image/webp，解码后单张最多 5 MB，请求体上限 8 MB。截图二进制存入同一 SQLite 的 payment_screenshots 表，与付款状态在同一事务提交。订单接口仅返回截图元信息；GET /api/orders/:id/payment-screenshot 仅允许订单所有者的有效会话读取。管理端使用 GET /api/order-management/orders/:id/payment-screenshot，必须持有原管理鉴权。图片响应为私有且禁止缓存。旧的已提交但无截图的订单可保留原流水和说明补充截图，待确认期间的截图不能替换。每轮重提追加一张图片，不覆盖旧图；启动时自动把旧表的一单一图约束迁移为一单多图，保留原截图 ID、二进制和关联。当前截图接口始终按订单归属及当前 `payment.screenshot.id` 读取，拒绝历史中的截图元信息与原二进制保留供审计。
 
 GET /api/products?query=关键词&page=1 必须登录。商品统一查询标准库 /admin/items/，固定 status=0、pageSize=20；UPC 使用 upc 参数，名称使用 searchIndex，query 留空可浏览商品。前端页码从 1 开始，转为上游从 0 开始的分页。不维护本地商品库，不使用本地商品作为失败回退。返回 id、name、upc、spec、price（整数分或 null）、brandId、brandName、imageUrl（HTTPS 主图或空字符串）、page、hasMore。STANDARD_ITEM_HOST、STANDARD_ITEM_KEY、STANDARD_ITEM_SECRET 仅由后台配置，浏览器不持有商品库签名。订单商品可携带 upc、catalogId、imageUrl 作为快照；imageUrl 为选填的 HTTPS 图片地址（最多 2048 字符，不含用户名密码），随订单入库并在列表和详情返回，无图商品可省略。该展示字段不转发给履约建单接口。单价继续由建单人确认。
 

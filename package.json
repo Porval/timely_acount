@@ -1,6 +1,6 @@
 {
   "name": "extras-account",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "private": true,
   "description": "账号系统开发工程",
   "type": "module",
