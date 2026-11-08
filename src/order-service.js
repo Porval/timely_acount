@@ -24,6 +24,14 @@ const integer = (value, label, min, max) => {
   return value;
 };
 const digest = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+const createdOnDate = 'created_at >= ? AND created_at < ?';
+function creationDateRange(date) {
+  if (typeof date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(date)) fail(400, '请选择有效的订单创建日期');
+  const midnightUtc = new Date(date + 'T00:00:00Z');
+  if (!Number.isFinite(midnightUtc.getTime()) || midnightUtc.toISOString().slice(0, 10) !== date) fail(400, '请选择有效的订单创建日期');
+  const midnightBeijing = midnightUtc.getTime() - 8 * 3600000;
+  return [midnightBeijing, midnightBeijing + 24 * 3600000];
+}
 const filterStages = new Set([
   '待报价', '待付款', '付款待审核', '待接单', '已接单', '配送中', '已完成', '履约异常', '已挂起', '已退款',
   '已收款待审核', '审核未通过', '审核通过待建单',
@@ -87,7 +95,10 @@ export class OrderService {
       if (query[field]) { const value = text(query[field], '筛选条件', 1000); filters.push(`instr(lower(${expression}),lower(?))>0`); params.push(value); }
     }
     if (query.item) { filters.push("EXISTS (SELECT 1 FROM json_each(json_extract(data,'$.items')) WHERE instr(lower(json_extract(value,'$.itemName') || ' ' || coalesce(json_extract(value,'$.spec'),'')),lower(?))>0)"); params.push(text(query.item,'商品筛选',120)); }
-    if (query.date) { if (!/^\d{4}-\d{2}-\d{2}$/.test(query.date)) fail(400,'日期筛选格式不正确'); filters.push("date(created_at/1000,'unixepoch','+8 hours')=?"); params.push(query.date); }
+    if (query.date) {
+      filters.push(createdOnDate);
+      params.push(...creationDateRange(query.date));
+    }
     if (query.stage) {
       const stages = legacyStageFilters.get(query.stage) || [query.stage];
       if (!stages.every(value => filterStages.has(value))) fail(400, '进度筛选不正确');
@@ -113,6 +124,12 @@ export class OrderService {
     const orders = this.db.prepare(`SELECT data FROM orders ${where} ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?`)
       .all(...params, pageSize, (page - 1) * pageSize).map(row => JSON.parse(row.data));
     return { orders, total, page, pageSize };
+  }
+  exportByDate(date) {
+    const range = creationDateRange(date);
+    const orders = this.db.prepare('SELECT data FROM orders WHERE ' + createdOnDate + ' ORDER BY created_at DESC, rowid DESC')
+      .all(...range).map(row => JSON.parse(row.data));
+    return { orders, total: orders.length };
   }
   create(account, input, createKey) {
     const key = text(createKey, 'Idempotency-Key', 120);
@@ -196,8 +213,8 @@ export class OrderService {
         if (existing.order_id !== id || existing.type !== type || existing.payload_hash !== hash) fail(409, 'eventId 已用于其他内容');
         return { order: this.get(id), replayed: true };
       }
-      const order = this.get(id); apply(order);
-      this.store.write(order, this.now());
+      const order = this.get(id);
+      if (apply(order) !== false) this.store.write(order, this.now());
       this.db.prepare('INSERT INTO management_events(event_id,order_id,type,payload_hash,received_at) VALUES(?,?,?,?,?)')
         .run(event, id, type, hash, this.now());
       return { order, replayed: false };
@@ -218,22 +235,32 @@ export class OrderService {
     });
   }
   receipt(id, input) {
-    const payload = { transactionId: text(input.transactionId, '收款流水号', 120), amount: integer(input.amount, '收款金额（分）', 1, 99999999),
-      collectedAt: this.timestamp(input.collectedAt, '收款时间'), ...(input.noteId === undefined ? {} : { noteId: text(input.noteId, '付款资料编号', 120) }) };
+    const payload = {
+      transactionId: text(input.transactionId, '收款流水号', 120),
+      amount: integer(input.amount, '收款金额（分）', 1, 99999999),
+      ...(input.collectedAt === undefined ? {} : { collectedAt: this.timestamp(input.collectedAt, '收款时间') }),
+      ...(input.noteId === undefined ? {} : { noteId: text(input.noteId, '付款资料编号', 120) }),
+    };
     return this.receive(id, 'receipt', input.eventId, payload, order => {
       if (order.quote) {
         if (order.quote.status !== 'quoted') fail(409, '订单尚未报价，不能确认收款');
         if (!['submitted', 'paid'].includes(order.payment.status)) fail(409, '请等待服务商提交付款资料后再确认收款');
       }
       if (payload.noteId !== undefined && payload.noteId !== order.payment.noteId) fail(409, '付款资料已更新，请刷新订单后确认收款');
-      if (order.payment.rejections?.length && (order.payment.status !== 'submitted' || !payload.noteId)) fail(409, '退回后的付款资料必须重新提交，并核对本次付款资料编号');
+      if (order.payment.rejections?.length && (!['submitted', 'paid'].includes(order.payment.status) || !payload.noteId)) fail(409, '退回后的付款资料必须重新提交，并核对本次付款资料编号');
       if (this.db.prepare("SELECT id FROM orders WHERE json_extract(data,'$.payment.transactionId')=? AND id<>?").get(payload.transactionId, order.id)) fail(409, '该收款流水已用于其他订单');
       if (payload.amount !== order.payPrice) fail(409, '实收金额与应付金额不一致');
       if (order.payment.status === 'paid') {
-        if (order.payment.transactionId !== payload.transactionId || order.payment.paidAt !== payload.collectedAt) fail(409, '订单已有不同的收款记录');
-        return;
+        const savedCollectedAt = order.payment.collectedAt ?? (order.payment.confirmedAt === undefined ? order.payment.paidAt : undefined);
+        if (order.payment.transactionId !== payload.transactionId || (order.payment.amount ?? order.payPrice) !== payload.amount ||
+            (payload.collectedAt !== undefined && savedCollectedAt !== payload.collectedAt)) fail(409, '订单已有不同的收款记录');
+        return false;
       }
-      order.payment = { ...order.payment, status: 'paid', ...payload, paidAt: payload.collectedAt, payerId: order.ownerId, payerName: order.operatorName };
+      const confirmedAt = this.now();
+      order.payment = {
+        ...order.payment, status: 'paid', ...payload, confirmedAt, paidAt: payload.collectedAt ?? confirmedAt,
+        payerId: order.ownerId, payerName: order.operatorName,
+      };
       // The approved marker keeps the original fulfillment guard and history format compatible.
       order.review = { status: 'approved' };
       this.event(order, '确认收款', `管理端确认实际到账 ${payload.amount} 分，系统将自动创建履约订单。`);

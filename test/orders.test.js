@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createApp } from '../src/server.js';
@@ -40,6 +41,53 @@ test('订单实际入库、登录身份防伪、重复创建幂等和账号隔�
   assert.equal((await f.call('/api/orders')).status,401);
   assert.equal((await f.create({...input(),referenceId:'bad',payPrice:24.68},'other-key')).status,400);
 });
+test('管理端导出北京时间创建日的全部订单，忽略筛选分页且保持账号访问限制', async t => {
+  const f = await fixture(t);
+  const day = '2026-11-08';
+  const midnight = Date.parse(day + 'T00:00:00+08:00');
+  let createdAt = midnight;
+  const orders = new OrderService(f.store, () => createdAt);
+  const createAt = (time, owner, referenceId) => {
+    createdAt = time;
+    return orders.create(owner, { ...input(), referenceId }, 'export-' + referenceId).order;
+  };
+  createAt(midnight - 1, f.owner, 'day-before');
+  const first = createAt(midnight, f.owner, 'start-of-day');
+  const expected = [first];
+  for (let index = 1; index <= 101; index++) {
+    expected.push(createAt(midnight + index, index % 2 ? f.owner : f.other, 'order-' + index));
+  }
+  expected.push(createAt(midnight + 86400000 - 1, f.other, 'end-of-day'));
+  createAt(midnight + 86400000, f.owner, 'next-day');
+  orders.submitManualPayment(first.id, f.owner, { reference: 'DAY-PAYMENT', screenshot });
+  orders.receipt(expected[1].id, { eventId: 'day-receipt', transactionId: 'DAY-RECEIPT', amount: 2468 });
+
+  const endpoint = '/api/order-management/orders';
+  const exportPath = endpoint + '?date=' + day + '&export=1&stage=待报价&page=2&pageSize=1&reference=未匹配&contacts=未匹配';
+  assert.equal((await f.call(exportPath, { cookie: f.cookie })).status, 401);
+  const exported = await f.call(exportPath, { management: true });
+  assert.equal(exported.status, 200);
+  assert.deepEqual(Object.keys(exported.data).sort(), ['orders', 'total']);
+  assert.equal(exported.data.total, expected.length);
+  assert.deepEqual(exported.data.orders.map(order => order.id), [...expected].reverse().map(order => order.id));
+  assert.deepEqual(new Set(exported.data.orders.map(order => order.payment.status)), new Set(['unpaid', 'paid', 'submitted']));
+
+  const managementList = await f.call(endpoint + '?date=' + day + '&stage=付款待审核', { management: true });
+  assert.deepEqual(managementList.data.orders.map(order => order.id), [first.id]);
+  const providerList = await f.call('/api/orders?date=' + day + '&export=1&pageSize=1', { cookie: f.cookie });
+  const owned = expected.filter(order => order.ownerId === f.owner.id);
+  assert.equal(providerList.status, 200);
+  assert.equal(providerList.data.total, owned.length);
+  assert.equal(providerList.data.orders.length, 1);
+  assert.equal(providerList.data.orders[0].ownerId, f.owner.id);
+
+  for (const date of ['', '2026-02-30', '2026-13-01', '2026-1-08']) {
+    assert.equal((await f.call(endpoint + '?export=1&date=' + date, { management: true })).status, 400);
+  }
+  assert.equal((await f.call('/api/orders?date=2026-02-30', { cookie: f.cookie })).status, 400);
+  const empty = await f.call(endpoint + '?export=1&date=2026-11-10', { management: true });
+  assert.deepEqual(empty.data, { orders: [], total: 0 });
+});
 test('手动付款提交不代表到账，只有管理端能确认收款并创建唯一任务',async t=>{
   const f=await fixture(t);const order=(await f.create()).data.order;
   const path=`/api/order-management/orders/${order.id}`;
@@ -55,6 +103,12 @@ test('手动付款提交不代表到账，只有管理端能确认收款并创�
   assert.equal((await f.call(`${path}/receipt`,{method:'POST',management:true,key:'wrong',body:receipt})).status,401);
   const saved=f.orders.get(order.id);
   assert.equal(saved.payment.status,'paid');assert.equal(saved.review.status,'approved');assert.equal(saved.external.status,'queued');
+  assert.equal(saved.payment.collectedAt, receipt.collectedAt);
+  assert.equal(saved.payment.paidAt, receipt.collectedAt);
+  assert.ok(saved.payment.confirmedAt >= receipt.collectedAt);
+  const { eventId, transactionId, amount, collectedAt } = receipt;
+  const legacyHash = createHash('sha256').update(JSON.stringify({ transactionId, amount, collectedAt })).digest('hex');
+  assert.equal(f.store.db.prepare('SELECT payload_hash FROM management_events WHERE event_id=?').get(eventId).payload_hash, legacyHash);
   assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM fulfillment_jobs').get().n,1);
   const review={eventId:'review-1',status:'approved',reviewerName:'管理端',reviewedAt:Date.now()};
   assert.equal((await f.call(`${path}/review`,{method:'POST',management:true,body:review})).status,409);
@@ -250,14 +304,29 @@ test('服务商与管理端接口均返回同步的备注配送信息，其他�
  assert.equal((await f.call('/api/orders',{cookie:f.cookie})).data.orders[0].fulfillment.sourceStatus,'已呼叫跑腿');
 });
 
-test('确认到账后立即自动建单并同步首份配送快照',async t=>{
+test('无须录入到账时间即可确认到账、幂等建单并同步首份配送快照',async t=>{
   let creates=0,queries=0;const client=async()=>{creates++;return 'auto-linked'};client.query=async id=>{queries++;return {id,status:1,memos:[{id:'memo',content:'履约方已接单'}],logiticsOrder:null}};
   const f=await fixture(t,{},client),order=(await f.create()).data.order;
   const path=`/api/order-management/orders/${order.id}/receipt`;
-  const body={eventId:'auto-receipt',transactionId:'AUTO-TX',amount:2468,collectedAt:Date.now()};
-  assert.equal((await f.call(path,{method:'POST',management:true,body})).status,200);
-  assert.equal((await f.call(path,{method:'POST',management:true,body})).data.replayed,true);
+  const body={eventId:'auto-receipt',transactionId:'AUTO-TX',amount:2468};
+  const before = Date.now();
+  const confirmed = await f.call(path,{method:'POST',management:true,body});
+  assert.equal(confirmed.status,200);
+  const payment = confirmed.data.order.payment;
+  assert.ok(payment.confirmedAt >= before && payment.confirmedAt <= Date.now());
+  assert.equal(payment.paidAt, payment.confirmedAt);
+  assert.equal(Object.hasOwn(payment, 'collectedAt'), false);
+  const replay = await f.call(path,{method:'POST',management:true,body});
+  assert.equal(replay.data.replayed,true);
+  assert.deepEqual(replay.data.order.payment, payment);
+  assert.equal((await f.call(path,{method:'POST',management:true,body:{...body,collectedAt:payment.confirmedAt}})).status,409);
   for(let index=0;index<50&&!f.orders.get(order.id).fulfillment.syncedAt;index++)await new Promise(resolve=>setTimeout(resolve,10));
+  const second = await f.call(path,{method:'POST',management:true,body:{...body,eventId:'repeat-auto-receipt'}});
+  assert.equal(second.status, 200);
+  assert.deepEqual(second.data.order.payment, payment);
+  assert.equal((await f.call(path,{method:'POST',management:true,body:{...body,eventId:'invalid-auto-receipt',collectedAt:payment.confirmedAt}})).status,409);
+  assert.equal((await f.call(path,{method:'POST',management:true,body:{...body,eventId:'different-auto-receipt',transactionId:'OTHER-TX'}})).status,409);
+  assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM fulfillment_jobs').get().n,1);
   const saved=f.orders.get(order.id);assert.equal(saved.external.timelyOrderId,'auto-linked');assert.equal(saved.fulfillment.memos[0].content,'履约方已接单');assert.equal(creates,1);assert.equal(queries,1);
 });
 
@@ -349,6 +418,9 @@ test('退回后的陈旧操作均被阻止，正确轮次确认后幂等地排�
   assert.equal((await f.call(`${path}/receipt`,{method:'POST',management:true,body:{...confirmed,noteId:first.noteId}})).status,409);
   assert.equal((await f.call(`${path}/reject-payment`,{method:'POST',management:true,body:{eventId:'reject-paid',noteId:second.noteId,reason:'不能退回已收款',reviewerName:'核对人',rejectedAt:Date.now()}})).status,409);
   const saved=f.orders.get(order.id);assert.equal(saved.payment.status,'paid');assert.equal(saved.review.status,'approved');assert.equal(saved.payment.rejections.length,1);assert.equal(saved.external.status,'queued');
+  const retry = f.orders.receipt(order.id, { ...confirmed, eventId: 'repeat-current-note', collectedAt: undefined });
+  assert.deepEqual(retry.order.payment, saved.payment);
+  assert.throws(() => f.orders.receipt(order.id, { ...confirmed, eventId: 'repeat-old-note', noteId: first.noteId, collectedAt: undefined }), /付款资料已更新/);
   assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM fulfillment_jobs').get().n,1);
 });
 

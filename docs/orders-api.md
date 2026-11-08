@@ -58,7 +58,8 @@ Content-Type: application/json
 
 | 方法 | 路径 | 功能 |
 | --- | --- | --- |
-| GET | `/api/order-management/orders` | 管理端查询订单；支持分页、`reviewStatus`、`stage=待报价`、`quoteStatus=pending\|quoted` |
+| GET | `/api/order-management/orders` | 管理端查询订单，支持分页、`date`、`reviewStatus`、`stage=待报价`、`quoteStatus=pending\|quoted` |
+| GET | `/api/order-management/orders?date=YYYY-MM-DD&export=1` | 按北京时间的创建日期导出当日全部订单 |
 | GET | `/api/order-management/orders/:id` | 查询订单、付款信息和履约进度 |
 | POST | `/api/order-management/orders/:id/quote` | 提交整单报价，待报价订单仅能报价一次 |
 | POST | `/api/order-management/orders/:id/receipt` | 确认实际到账并自动发起履约建单，建议始终携带当前 noteId |
@@ -68,6 +69,8 @@ Content-Type: application/json
 | POST | `/api/order-management/orders/:id/link` | 建单结果未确认时，人工核对已有履约订单后关联，避免重复创建 |
 
 `eventId` 是管理端的唯一事件编号。同一事件重发相同内容返回 `replayed:true`；同编号不同内容返回 409。事件和订单状态在同一数据库事务中保存。
+
+导出要求填写有效创建日期，按创建时间倒序返回 `{ orders, total }`，范围为该日期北京时间零点到次日零点前。导出覆盖该日所有状态和服务商，忽略分页与其他筛选。服务商端仍按账号分页查询。
 
 ### 报价
 
@@ -80,10 +83,12 @@ Content-Type: application/json
 ### 1. 确认实际收款
 
 ```json
-{ "eventId": "receipt-20261008-001", "noteId": "当前 payment.noteId", "transactionId": "实际收款流水号", "amount": 2468, "collectedAt": 1791460800000 }
+{ "eventId": "receipt-20261008-001", "noteId": "当前 payment.noteId", "transactionId": "实际收款流水号", "amount": 2468 }
 ```
 
-金额必须等于订单应付金额，同一收款流水不能用于两个订单。`noteId` 提供时必须匹配当前付款资料，并参与事件内容幂等校验。经历过付款资料退回的订单，首次确认必须处于 `submitted` 且携带正确 `noteId`，避免陈旧页面确认新一轮付款。报价订单必须已报价且服务商已提交付款资料。从未退回的历史或兼容模式订单可继续省略 `noteId`、直接确认未提交付款资料的订单。`collectedAt` 表示真实到账时间，可早于提交或重提资料时间。首次确认到账时，同一事务保存 `payment.status=paid`、兼容履约检查的 `review.status=approved` 和唯一建单任务，随后后台自动建单。返回 `external.status=queued` 表示任务已入队，取得履约订单号后更新为 `created`。
+金额必须等于订单应付金额，同一收款流水不能用于两个订单。`noteId` 提供时必须匹配当前付款资料，并参与事件内容幂等校验。经历过付款资料退回的订单，首次确认必须处于 `submitted` 且携带正确 `noteId`，避免陈旧页面确认新一轮付款。报价订单必须已报价且服务商已提交付款资料。从未退回的历史或兼容模式订单可继续省略 `noteId`、直接确认未提交付款资料的订单。
+
+服务器记录操作时间 `payment.confirmedAt`。真实到账时间 `collectedAt` 可选，提供时原样保存。兼容字段 `payment.paidAt` 优先使用真实到账时间，未提供时使用确认时间。首次确认到账时，同一事务保存 `payment.status=paid`、兼容履约检查的 `review.status=approved` 和唯一建单任务，随后后台自动建单。返回 `external.status=queued` 表示任务已入队，取得履约订单号后更新为 `created`。
 
 ### 1.1 收款前退回付款资料
 
