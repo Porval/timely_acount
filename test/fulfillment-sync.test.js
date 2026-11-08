@@ -34,6 +34,18 @@ test('错误关联和旧快照不覆盖已有履约资料，退款及异常不�
  for(const [status,label] of [[5,'已完成'],[6,'已退款'],[8,'履约异常']]){f.orders.syncFulfillment(f.order.id,{...data,status});assert.equal(stage(f.orders.get(f.order.id)),label);assert.equal(f.orders.list(null,{stage:label}).total,1)}
  f.orders.syncFulfillment(f.order.id,{...data,hungup:true});assert.equal(stage(f.orders.get(f.order.id)),'已挂起');
 });
+test('履约四个正常状态按实际进度分别筛选，旧版筛选继续可用', t => {
+ const f = fixture(t);
+ const labels = ['待接单', '已接单', '配送中', '已完成'];
+ const cases = [[0, '待接单'], [1, '已接单'], [2, '已接单'], [3, '已接单'], [7, '已接单'], [4, '配送中'], [5, '已完成']];
+ for (const [status, label] of cases) {
+   f.orders.syncFulfillment(f.order.id, { id: 'linked', status });
+   assert.equal(stage(f.orders.get(f.order.id)), label);
+   for (const filter of labels) assert.equal(f.orders.list(f.owner.id, { stage: filter }).total, Number(filter === label));
+   assert.equal(f.orders.list(f.owner.id, { stage: '待履约' }).total, Number(label === '待接单'));
+   assert.equal(f.orders.list(f.owner.id, { stage: '履约中' }).total, Number(label === '已接单' || label === '配送中'));
+ }
+});
 test('无需打开详情即可后台同步，失败保留原资料，冷却后恢复，未审核订单不查询',async t=>{
  const f=fixture(t);f.create('UNPAID');let calls=0,fail=false,data=snapshot();
  const sync=new FulfillmentSynchronizer(f.orders,{query:async id=>{calls++;assert.equal(id,'linked');if(fail)throw new Error('temporary');return data}});t.after(()=>sync.close());

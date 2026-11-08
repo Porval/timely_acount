@@ -103,6 +103,7 @@ test('发起方进度筛选及建单结果未确认时不会自动重复请求',
   const f=await fixture(t);const order=(await f.create()).data.order;
   const submitted=await f.call(`/api/orders/${order.id}/manual-payment`,{method:'POST',cookie:f.cookie,body:{reference:'TEST-REF',description:'人工付款',screenshot}});
   assert.equal(submitted.status,200);
+  assert.equal((await f.call('/api/orders?stage='+encodeURIComponent('付款待审核')+'&item='+encodeURIComponent('测试商品'),{cookie:f.cookie})).data.total,1);
   assert.equal((await f.call('/api/orders?stage='+encodeURIComponent('待收款确认')+'&item='+encodeURIComponent('测试商品'),{cookie:f.cookie})).data.total,1);
   assert.equal((await f.call('/api/orders?stage='+encodeURIComponent('待付款'),{cookie:f.cookie})).data.total,0);
   f.orders.receipt(order.id,{eventId:'receipt-final',transactionId:'TX-FINAL',amount:2468,collectedAt:Date.now()});

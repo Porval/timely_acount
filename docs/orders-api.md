@@ -41,7 +41,9 @@
 { "reference": "银行或支付平台流水号", "description": "手动付款说明", "screenshot": { "contentType": "image/png", "data": "原图纯base64内容" } }
 ```
 
-订单变为 `payment.status=submitted`，页面显示待收款确认。只有管理端可以确认到账。
+订单变为 `payment.status=submitted`，页面显示「付款待审核」。管理员核实到账后确认，系统自动建单。
+
+订单列表可按 `stage=付款待审核`、`待接单`、`已接单`、`配送中`、`已完成` 查询。旧版的 `待收款确认` 和 `待履约` 分别对应 `付款待审核` 和 `待接单`，`履约中` 包含 `已接单` 和 `配送中`。
 
 ## 管理端接口
 

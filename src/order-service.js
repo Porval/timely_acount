@@ -24,9 +24,18 @@ const integer = (value, label, min, max) => {
   return value;
 };
 const digest = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+const filterStages = new Set([
+  '待报价', '待付款', '付款待审核', '待接单', '已接单', '配送中', '已完成', '履约异常', '已挂起', '已退款',
+  '已收款待审核', '审核未通过', '审核通过待建单',
+]);
+const legacyStageFilters = new Map([
+  ['待收款确认', ['付款待审核']],
+  ['待履约', ['待接单']],
+  ['履约中', ['已接单', '配送中']],
+]);
 export function stage(order) {
   if (order.quote?.status === 'pending') return '待报价';
-  if (order.payment.status === 'submitted') return '待收款确认';
+  if (order.payment.status === 'submitted') return '付款待审核';
   if (order.payment.status !== 'paid') return '待付款';
   if (order.review.status === 'rejected') return '审核未通过';
   if (order.review.status !== 'approved') return '已收款待审核';
@@ -35,7 +44,9 @@ export function stage(order) {
   if (order.fulfillment.sourceCode === 8 || order.fulfillment.errorOrder) return '履约异常';
   if (order.fulfillment.hungup) return '已挂起';
   if (order.fulfillment.status === 'delivered') return '已完成';
-  return order.fulfillment.status === 'waiting' ? '待履约' : '履约中';
+  if (order.fulfillment.status === 'delivering') return '配送中';
+  if (order.fulfillment.status === 'accepted') return '已接单';
+  return '待接单';
 }
 function validateOrder(input, requiresQuote) {
   if (!Array.isArray(input.items) || !input.items.length || input.items.length > 50) fail(400, '请填写 1 至 50 件商品');
@@ -78,8 +89,24 @@ export class OrderService {
     if (query.item) { filters.push("EXISTS (SELECT 1 FROM json_each(json_extract(data,'$.items')) WHERE instr(lower(json_extract(value,'$.itemName') || ' ' || coalesce(json_extract(value,'$.spec'),'')),lower(?))>0)"); params.push(text(query.item,'商品筛选',120)); }
     if (query.date) { if (!/^\d{4}-\d{2}-\d{2}$/.test(query.date)) fail(400,'日期筛选格式不正确'); filters.push("date(created_at/1000,'unixepoch','+8 hours')=?"); params.push(query.date); }
     if (query.stage) {
-      if (!['待报价','待付款','待收款确认','已收款待审核','审核未通过','审核通过待建单','待履约','履约中','已完成','已退款','履约异常','已挂起'].includes(query.stage)) fail(400,'进度筛选不正确');
-      filters.push("CASE WHEN json_extract(data,'$.quote.status')='pending' THEN '待报价' WHEN json_extract(data,'$.payment.status')='submitted' THEN '待收款确认' WHEN json_extract(data,'$.payment.status')!='paid' THEN '待付款' WHEN json_extract(data,'$.review.status')='rejected' THEN '审核未通过' WHEN json_extract(data,'$.review.status')!='approved' THEN '已收款待审核' WHEN json_extract(data,'$.external.status')!='created' THEN '审核通过待建单' WHEN json_extract(data,'$.fulfillment.sourceCode')=6 THEN '已退款' WHEN json_extract(data,'$.fulfillment.sourceCode')=8 OR json_extract(data,'$.fulfillment.errorOrder')=1 THEN '履约异常' WHEN json_extract(data,'$.fulfillment.hungup')=1 THEN '已挂起' WHEN json_extract(data,'$.fulfillment.status')='delivered' THEN '已完成' WHEN json_extract(data,'$.fulfillment.status')='waiting' THEN '待履约' ELSE '履约中' END=?"); params.push(query.stage);
+      const stages = legacyStageFilters.get(query.stage) || [query.stage];
+      if (!stages.every(value => filterStages.has(value))) fail(400, '进度筛选不正确');
+      filters.push(`CASE
+        WHEN json_extract(data,'$.quote.status')='pending' THEN '待报价'
+        WHEN json_extract(data,'$.payment.status')='submitted' THEN '付款待审核'
+        WHEN json_extract(data,'$.payment.status')!='paid' THEN '待付款'
+        WHEN json_extract(data,'$.review.status')='rejected' THEN '审核未通过'
+        WHEN json_extract(data,'$.review.status')!='approved' THEN '已收款待审核'
+        WHEN json_extract(data,'$.external.status')!='created' THEN '审核通过待建单'
+        WHEN json_extract(data,'$.fulfillment.sourceCode')=6 THEN '已退款'
+        WHEN json_extract(data,'$.fulfillment.sourceCode')=8 OR json_extract(data,'$.fulfillment.errorOrder')=1 THEN '履约异常'
+        WHEN json_extract(data,'$.fulfillment.hungup')=1 THEN '已挂起'
+        WHEN json_extract(data,'$.fulfillment.status')='delivered' THEN '已完成'
+        WHEN json_extract(data,'$.fulfillment.status')='delivering' THEN '配送中'
+        WHEN json_extract(data,'$.fulfillment.status')='accepted' THEN '已接单'
+        ELSE '待接单'
+      END IN (${stages.map(() => '?').join(',')})`);
+      params.push(...stages);
     }
     const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
     const total = this.db.prepare(`SELECT count(*) AS total FROM orders ${where}`).get(...params).total;
@@ -150,7 +177,7 @@ export class OrderService {
     const payload = { noteId: text(input.noteId, '付款资料编号', 120), reason: text(input.reason, '退回原因', 1000),
       reviewerName: text(input.reviewerName, '核对人员', 80), rejectedAt: this.timestamp(input.rejectedAt, '退回时间') };
     return this.receive(id, 'reject-payment', input.eventId, payload, order => {
-      if (order.payment.status !== 'submitted' || order.payment.noteId !== payload.noteId) fail(409, '付款资料已更新或不在待收款确认状态，请刷新订单');
+      if (order.payment.status !== 'submitted' || order.payment.noteId !== payload.noteId) fail(409, '付款资料已更新或不在付款待审核状态，请刷新订单');
       if (payload.rejectedAt < order.payment.submittedAt) fail(409, '退回时间不能早于付款资料提交时间');
       if (order.review.status !== 'not_submitted' || order.external.status !== 'not_created') fail(409, '订单已进入后续处理，不能退回付款资料');
       const previous = order.payment;
