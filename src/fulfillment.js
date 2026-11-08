@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { createFulfillmentRefunds } from './fulfillment-refunds.js';
 
 export function signParams(input, key, secret, now = Date.now) {
   const params = { ...input, appKey: key, date: new Date(now()).toISOString() };
@@ -23,14 +24,29 @@ export function createFulfillmentClient(config, fetchImpl = fetch, now = Date.no
     if (!payload || payload.error || !entity || !['string', 'number'].includes(typeof entity.id) || !String(entity.id).trim()) throw new Error('履约建单接口未返回有效订单 ID');
     return String(entity.id);
   };
-  const get = async (path, params = {}) => {
+  const get = async (path, params = {}, timeout = 10000) => {
     const target = new URL(path, config.timelyHost.endsWith('/') ? config.timelyHost : `${config.timelyHost}/`);
     for (const [key, value] of Object.entries(signParams(params, config.timelyKey, config.timelySecret, now))) target.searchParams.set(key, String(value));
-    const response = await fetchImpl(target, { redirect: 'error', signal: AbortSignal.timeout(10000) });
+    const response = await fetchImpl(target, { redirect: 'error', signal: AbortSignal.timeout(timeout) });
     if (!response.ok) throw new Error('履约系统查询失败');
     const body = await response.json(); if (body?.error) throw new Error('履约系统返回异常'); return body?.data || body;
   };
   client.query = id => get(`admin/order/${encodeURIComponent(id)}`);
+  client.refunds = createFulfillmentRefunds({
+    get: path => get(path, {}, 2500),
+    post: async (path, input) => {
+      const target = new URL(path, config.timelyHost.endsWith('/') ? config.timelyHost : `${config.timelyHost}/`);
+      const response = await fetchImpl(target, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(signParams(input, config.timelyKey, config.timelySecret, now)),
+        redirect: 'error', signal: AbortSignal.timeout(2500),
+      });
+      if (!response.ok) throw new Error('履约退款标识操作失败');
+      const result = await response.json();
+      if (result?.error) throw new Error('履约系统返回异常');
+      return result?.data || result;
+    },
+  });
   client.options = async () => {
     const rows = await Promise.all(['cities','brands','plateForms'].map(path => get(`admin/${path}/`, {pageSize:0,...(path === 'brands' ? {locked:true} : {})})));
     const normalize = data => { if (!Array.isArray(data)) throw new Error('履约目录响应异常'); return data.filter(row => row.id !== undefined && typeof row.name === 'string').map(row => ({id:String(row.id),name:row.name})); };

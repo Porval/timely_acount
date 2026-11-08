@@ -75,6 +75,21 @@ Content-Type: application/json
 
 导出覆盖所有服务商，跳过 `quote.status=pending` 的待报价订单，兼容没有报价字段的历史订单。导出查询忽略分页和其他列表筛选。
 
+### 服务商退款申请
+
+`ORDER_REFUND_ENABLED` 默认关闭。启用时还需可用的履约退款适配器。
+
+| 使用方 | 方法与路径 | 请求和返回 |
+| --- | --- | --- |
+| 服务商 | `GET /api/orders/:id` | 返回 `{order,canRequestRefund}`。当前账号拥有订单、已确认到账且已关联履约单、没有退款申请时才可提交。 |
+| 服务商 | `POST /api/orders/:id/refund-request` | 请求 `{reason}` 和 `Idempotency-Key`，返回 `{order}`。原因去除首尾空白后长度为 1–200 个 UTF-16 码元。同账号以同一个键重发相同申请时返回当前结果，同键改内容返回 409。 |
+| 管理端 | `GET /api/order-management/orders?refundOnly=1` | 分页查询已有退款申请的服务商订单。 |
+| 管理端 | `POST /api/order-management/orders/:id/refund-mark` | 请求 `{refundId,eventId,operatorName}`，返回 `{order,replayed}`。写入待核对状态后调用旧履约标识接口。 |
+| 履约确认桥 | `POST /api/order-management/fulfillment-refunds/:refundId/confirm` | 仅服务端持管理密钥调用。桥从履约人员登录态注入 `{operatorId,operatorName}`，履约适配器核对旧单的接单人员，返回 `{status}`。 |
+| 管理端 | `POST /api/order-management/orders/:id/refund-initiate` | 请求 `{refundId,eventId,operatorName}`，返回 `{order,replayed}`。首次操作重新核验履约标识已确认，随后登记发起退款。 |
+
+退款独立记录在订单的 `refund` 字段，包含 `id`、`status`、`reason`、`requestedAt`，以及各步骤的 `markedAt`、`confirmedAt`、`initiatedAt` 和可选提示 `message`。进度依次为 `requested`（申请已提交）、`mark_pending`（标识结果待核对）、`awaiting_fulfillment`（等待履约人员确认）、`ready_to_refund`（履约已确认）和 `initiated`（已发起退款）。标识调用失败或超时后，可查询管理端订单详情回查标识，或用原事件重试。最终登记发起退款后按线下流程处理款项。
+
 ### 报价
 
 ```json
@@ -186,7 +201,11 @@ TIMELY_CREATOR_ID=实际创建人员ID
 
 POST /api/orders/:id/manual-payment 新增必填 screenshot：{contentType: 'image/png', data: '原图文件的纯 base64 内容，不含 data: 前缀'}，支持 image/jpeg、image/png、image/webp，解码后单张最多 5 MB，请求体上限 8 MB。截图二进制存入同一 SQLite 的 payment_screenshots 表，与付款状态在同一事务提交。订单接口仅返回截图元信息；GET /api/orders/:id/payment-screenshot 仅允许订单所有者的有效会话读取。管理端使用 GET /api/order-management/orders/:id/payment-screenshot，必须持有原管理鉴权。图片响应为私有且禁止缓存。旧的已提交但无截图的订单可保留原流水和说明补充截图，待确认期间的截图不能替换。每轮重提追加一张图片，不覆盖旧图；启动时自动把旧表的一单一图约束迁移为一单多图，保留原截图 ID、二进制和关联。当前截图接口始终按订单归属及当前 `payment.screenshot.id` 读取，拒绝历史中的截图元信息与原二进制保留供审计。
 
-GET /api/products?query=关键词&page=1 必须登录。商品统一查询标准库 /admin/items/，固定 status=0、pageSize=20；UPC 使用 upc 参数，名称使用 searchIndex，query 留空可浏览商品。前端页码从 1 开始，转为上游从 0 开始的分页。不维护本地商品库，不使用本地商品作为失败回退。返回 id、name、upc、spec、price（整数分或 null）、brandId、brandName、imageUrl（HTTPS 主图或空字符串）、page、hasMore。STANDARD_ITEM_HOST、STANDARD_ITEM_KEY、STANDARD_ITEM_SECRET 仅由后台配置，浏览器不持有商品库签名。订单商品可携带 upc、catalogId、imageUrl 作为快照；imageUrl 为选填的 HTTPS 图片地址（最多 2048 字符，不含用户名密码），随订单入库并在列表和详情返回，无图商品可省略。该展示字段不转发给履约建单接口。单价继续由建单人确认。
+`GET /api/products?query=关键词&page=1` 必须登录。商品统一查询标准库 `/admin/items/` 的 `status=0` 数据，前端页码从 1 开始。留空可浏览商品，单词按 `searchIndex` 查询，完整 UPC 按 `upc` 精确查询，这三种方式直接读取上游对应的 20 条分页。
+
+多个关键词用空格分隔，统一字符宽度和大小写、去重后逐词匹配。后台优先用最长的非容量词查询候选商品，每批最多 100 条，再从商品索引、名称、品牌、规格等字段筛出命中全部词的商品。返回 `{products,page,hasMore}`，每页最多 20 条。扫描最多 8 批或 8 秒，达到上限且无法确认剩余匹配时返回 `limited:true`。商品库故障返回查询错误。`STANDARD_ITEM_HOST`、`STANDARD_ITEM_KEY`、`STANDARD_ITEM_SECRET` 由后台配置。
+
+商品包含 `id`、`name`、`upc`、`spec`、`price`（整数分或 `null`）、`brandId`、`brandName`、`imageUrl`（HTTPS 主图或空字符串）。订单商品可携带 `upc`、`catalogId`、`imageUrl` 作为快照。图片地址选填，最长 2048 字符，随订单入库并在列表和详情返回。建单人确认单价。
 
 
 ## 履约状态、备注与配送信息同步

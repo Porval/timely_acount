@@ -9,6 +9,8 @@ export function loadConfig(env = process.env) {
   const quoteMode = env.ORDER_QUOTE_REQUIRED;
   if (quoteMode !== undefined && !['true', 'false'].includes(quoteMode)) throw new Error('ORDER_QUOTE_REQUIRED 仅支持 true 或 false');
   const requiresQuote = quoteMode === undefined ? !production : quoteMode === 'true';
+  const refundMode = env.ORDER_REFUND_ENABLED;
+  if (refundMode !== undefined && !['true', 'false'].includes(refundMode)) throw new Error('ORDER_REFUND_ENABLED 仅支持 true 或 false');
   const mode = env.SMS_MODE || (production ? 'remote' : 'console');
   if (!['console', 'remote'].includes(mode)) throw new Error('SMS_MODE 仅支持 console 或 remote');
   const port = Number(env.PORT || 3100);
@@ -42,7 +44,7 @@ export function loadConfig(env = process.env) {
     const localHttp = !production && target.protocol === 'http:' && ['127.0.0.1','localhost','[::1]'].includes(target.hostname);
     if ((target.protocol !== 'https:' && !localHttp) || target.username || target.password || target.search || target.hash) throw new Error('履约系统地址需为 HTTPS 基础地址，本机联调可用 HTTP');
   }
-  return { requiresQuote, standardHost:env.STANDARD_ITEM_HOST, standardKey:env.STANDARD_ITEM_KEY, standardSecret:env.STANDARD_ITEM_SECRET, timelyIdempotency: env.TIMELY_IDEMPOTENCY_SUPPORTED === 'true', managementToken: env.ORDER_MANAGEMENT_TOKEN, timelyHost, timelyKey: env.TIMELY_ORDER_KEY, timelySecret: env.TIMELY_ORDER_SECRET,
+  return { requiresQuote, refundEnabled: refundMode === 'true', standardHost:env.STANDARD_ITEM_HOST, standardKey:env.STANDARD_ITEM_KEY, standardSecret:env.STANDARD_ITEM_SECRET, timelyIdempotency: env.TIMELY_IDEMPOTENCY_SUPPORTED === 'true', managementToken: env.ORDER_MANAGEMENT_TOKEN, timelyHost, timelyKey: env.TIMELY_ORDER_KEY, timelySecret: env.TIMELY_ORDER_SECRET,
     timelyPlatform: env.TIMELY_PLATFORM_ID, timelyService: env.TIMELY_ORDER_SERVICE, timelyCreator: env.TIMELY_CREATOR_ID, host, port, production, smsMode: mode, smsHost: env.DEBUG_SMS_HOST, smsTemplate: env.DEBUG_SMS_TEM, smsCodeField: codeField, smsPhoneField: phoneField,
     smsToken: env.SMS_API_TOKEN, origin: env.APP_ORIGIN,
     databaseFile: resolve(ROOT, env.DATABASE_FILE || 'data/accounts.sqlite'),

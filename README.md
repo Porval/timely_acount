@@ -90,3 +90,13 @@ docs/development.md        接口及接入说明
 订单模块与账号共用 SQLite。发起方使用登录 Cookie 建单、查看报价、提交手动付款资料和查询进度。管理端使用专用 Bearer 密钥提交报价、核对并确认到账。确认到账后，后台自动创建履约订单并关联及时达 ID。报价流程在开发环境默认开启，生产环境待两个前端发布后设置 `ORDER_QUOTE_REQUIRED=true`。
 
 完整接口、JSON 示例和履约配置见 [订单接口说明](docs/orders-api.md)。
+
+### 管理端接口
+
+`management/extras-management.cjs` 提供浏览器访问的 `/api/extras-management` 接口，验证及时达管理端登录签名并将请求转发到同机订单后台。退款申请和状态更新由 `src/refund-service.js` 处理。管理端 Web 的 client 通过公开 HTTPS 地址调用，服务端管理密钥存放在管理接口进程的环境变量中。
+
+在仓库根目录运行以下命令可加载服务器既有的管理接口配置。
+
+```sh
+node --env-file=/etc/extras/management.env management/extras-management.cjs
+```

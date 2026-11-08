@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createApp } from '../src/server.js';
 import { SQLiteStore } from '../src/store.js';
-import { AccountService } from '../src/service.js';
+import { AccountService, AppError } from '../src/service.js';
 import { OrderService } from '../src/order-service.js';
 import { FulfillmentDispatcher, createFulfillmentClient, signParams } from '../src/fulfillment.js';
 
@@ -41,6 +41,136 @@ test('订单实际入库、登录身份防伪、重复创建幂等和账号隔�
   assert.equal((await f.call('/api/orders')).status,401);
   assert.equal((await f.create({...input(),referenceId:'bad',payPrice:24.68},'other-key')).status,400);
 });
+
+test('缺少履约退款适配器时服务端关闭退款操作', async t => {
+  const f = await fixture(t, { refundEnabled: true });
+  const order = (await f.create()).data.order;
+  f.orders.receipt(order.id, { eventId: 'disabled-receipt', transactionId: 'disabled-paid', amount: 2468 });
+  f.orders.link(order.id, { eventId: 'disabled-link', timelyOrderId: 'disabled-timely', description: '测试关联' });
+  const path = '/api/orders/' + order.id;
+  assert.equal((await f.call(path, { cookie: f.cookie })).data.canRequestRefund, false);
+  const disabled = await f.call(path + '/refund-request', {
+    method: 'POST', cookie: f.cookie, body: { reason: '订单退款' }, headers: { 'Idempotency-Key': 'disabled-refund' },
+  });
+  assert.equal(disabled.status, 503);
+  const denied = await f.call('/api/order-management/fulfillment-refunds/missing/confirm', {
+    method: 'POST', body: { operatorId: 'delivery', operatorName: '履约员' }, management: true,
+  });
+  assert.equal(denied.status, 503);
+  assert.equal(f.orders.get(order.id).refund, undefined);
+});
+
+test('服务商申请、履约标识与最终发起退款分开落库，支持回查和幂等重试', async t => {
+  let state = 'missing';
+  let markCalls = 0;
+  let inspectCalls = 0;
+  const assigned = { operatorId: 'assigned-operator', operatorName: '履约员' };
+  const client = async () => { throw new Error('测试中由本地夹具关联履约订单'); };
+  client.refunds = {
+    inspect: async () => {
+      inspectCalls++;
+      return { state, operatorId: assigned.operatorId };
+    },
+    mark: async order => {
+      assert.equal(order.external.timelyOrderId, 'refund-linked');
+      markCalls++;
+      state = 'open';
+      throw new AppError(502, '履约接口暂未确认结果');
+    },
+    confirm: async (order, operator) => {
+      assert.equal(order.external.timelyOrderId, 'refund-linked');
+      if (operator.operatorId !== assigned.operatorId) throw new AppError(403, '履约人员不匹配');
+      if (state === 'open') {
+        state = 'confirmed';
+        throw new AppError(502, '履约确认暂未返回结果');
+      }
+      return { state, operatorId: assigned.operatorId };
+    },
+  };
+  const f = await fixture(t, { refundEnabled: true }, client);
+  const order = (await f.create()).data.order;
+  const other = (await f.create({ ...input(), referenceId: 'REFUND-OTHER' }, 'refund-other')).data.order;
+  const path = '/api/orders/' + order.id;
+  const manager = '/api/order-management/orders';
+  const managerPath = manager + '/' + order.id;
+  const submit = (cookie, key, reason) => f.call(path + '/refund-request', {
+    method: 'POST', cookie, body: { reason }, headers: { 'Idempotency-Key': key },
+  });
+  assert.equal((await f.call(path, { cookie: f.cookie })).data.canRequestRefund, false);
+  assert.equal((await submit(f.cookie, 'refund-request', '不再需要')).status, 409);
+  f.orders.receipt(order.id, { eventId: 'refund-receipt', transactionId: 'refund-paid', amount: 2468 });
+  assert.equal((await f.call(path, { cookie: f.cookie })).data.canRequestRefund, false);
+  f.orders.link(order.id, { eventId: 'refund-link', timelyOrderId: 'refund-linked', description: '测试关联' });
+  f.orders.syncFulfillment(order.id, { id: 'refund-linked', status: 6 });
+  const prior = (await f.call(path, { cookie: f.cookie })).data;
+  assert.equal(prior.canRequestRefund, true);
+  const otherCookie = await f.login(f.other);
+  assert.equal((await submit(otherCookie, 'refund-request', '越权')).status, 404);
+  assert.equal((await submit(f.cookie, 'refund-request', ' ')).status, 400);
+  assert.equal((await submit(f.cookie, 'refund-request', '字'.repeat(201))).status, 400);
+  const applied = await submit(f.cookie, 'refund-request', '不再需要');
+  assert.equal(applied.status, 200);
+  const refundId = applied.data.order.refund.id;
+  assert.equal(applied.data.order.refund.status, 'requested');
+  assert.equal((await submit(f.cookie, 'refund-request', '不再需要')).data.order.refund.id, refundId);
+  assert.equal((await submit(f.cookie, 'refund-request', '变更原因')).status, 409);
+  assert.equal((await submit(f.cookie, 'new-refund-request', '不再需要')).status, 409);
+  assert.equal((await f.call(path, { cookie: f.cookie })).data.canRequestRefund, false);
+  const listed = await f.call(manager + '?refundOnly=1', { management: true });
+  assert.deepEqual(listed.data.orders.map(row => row.id), [order.id]);
+  const providerList = await f.call('/api/orders?refundOnly=1', { cookie: f.cookie });
+  assert.equal(providerList.data.total, 2);
+
+  const confirmPath = '/api/order-management/fulfillment-refunds/' + refundId + '/confirm';
+  const confirm = (operator, management = true) => f.call(confirmPath, { method: 'POST', management, body: operator });
+  const markBody = { refundId, eventId: 'refund-mark', operatorName: '管理员' };
+  const initiateBody = { ...markBody, eventId: 'refund-initiate' };
+  const act = (action, body, target = managerPath) => f.call(target + '/' + action, { method: 'POST', management: true, body });
+  assert.equal((await confirm(assigned, false)).status, 401);
+  assert.equal((await confirm(assigned)).status, 409);
+  assert.equal((await act('refund-initiate', initiateBody)).status, 409);
+  assert.equal((await act('refund-mark', markBody, manager + '/' + other.id)).status, 404);
+  assert.equal((await act('refund-mark', markBody)).status, 502);
+  assert.equal(f.orders.get(order.id).refund.status, 'mark_pending');
+  const recovered = await f.call(managerPath, { management: true });
+  assert.equal(recovered.data.order.refund.status, 'awaiting_fulfillment');
+  assert.ok(recovered.data.order.refund.markedAt);
+  const repeatedMark = await act('refund-mark', markBody);
+  assert.equal(repeatedMark.data.replayed, true);
+  assert.equal(markCalls, 1);
+  assert.equal((await confirm({ ...assigned, operatorId: 'other-operator' })).status, 403);
+  assert.equal((await confirm(assigned)).status, 502);
+  assert.equal(f.orders.get(order.id).refund.status, 'awaiting_fulfillment');
+  assert.equal((await act('refund-initiate', initiateBody)).status, 409);
+  assert.equal((await f.call(managerPath, { management: true })).data.order.refund.status, 'ready_to_refund');
+  assert.deepEqual((await confirm(assigned)).data, { status: 'ready_to_refund' });
+  assert.equal((await confirm({ ...assigned, operatorId: 'other-operator' })).status, 403);
+
+  state = 'open';
+  assert.equal((await act('refund-initiate', initiateBody)).status, 409);
+  assert.equal(f.orders.get(order.id).refund.status, 'ready_to_refund');
+  state = 'confirmed';
+  const initiated = await act('refund-initiate', initiateBody);
+  assert.equal(initiated.data.order.refund.status, 'initiated');
+  assert.ok(initiated.data.order.refund.confirmedAt);
+  assert.ok(initiated.data.order.refund.initiatedAt);
+  const readCount = inspectCalls;
+  state = 'blocked';
+  const replayed = await act('refund-initiate', initiateBody);
+  assert.equal(replayed.data.replayed, true);
+  assert.deepEqual(replayed.data.order.refund, initiated.data.order.refund);
+  assert.equal(inspectCalls, readCount);
+  assert.equal((await act('refund-initiate', { ...initiateBody, operatorName: '另一人员' })).status, 409);
+  assert.deepEqual((await confirm(assigned)).data, { status: 'initiated' });
+  assert.deepEqual(initiated.data.order.payment, prior.order.payment);
+  assert.deepEqual(initiated.data.order.review, prior.order.review);
+  assert.deepEqual(initiated.data.order.external, prior.order.external);
+  assert.deepEqual(initiated.data.order.fulfillment, prior.order.fulfillment);
+  assert.equal(initiated.data.order.events.filter(event => event.title === '申请退款').length, 1);
+  assert.equal(initiated.data.order.events.filter(event => event.title === '履约已确认退款标识').length, 1);
+  assert.equal(initiated.data.order.events.filter(event => event.title === '已发起退款').length, 1);
+});
+
 test('管理端按北京时间创建日期范围导出，覆盖首尾两日、排除待报价并忽略筛选分页', async t => {
   const f = await fixture(t);
   const startDate = '2026-11-08';

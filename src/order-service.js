@@ -89,6 +89,7 @@ export class OrderService {
     if (quoteStatus && !['pending', 'quoted'].includes(quoteStatus)) fail(400, '报价筛选状态不正确');
     const filters = []; const params = [];
     if (ownerId) { filters.push('owner_id=?'); params.push(ownerId); }
+    if (!ownerId && query.refundOnly === '1') filters.push("json_extract(data,'$.refund.id') IS NOT NULL");
     if (reviewStatus) { filters.push("json_extract(data,'$.review.status')=?"); params.push(reviewStatus); }
     if (quoteStatus) { filters.push("json_extract(data,'$.quote.status')=?"); params.push(quoteStatus); }
     for (const [field, expression] of [['contacts',"json_extract(data,'$.contacts')"], ['reference','reference_id']]) {

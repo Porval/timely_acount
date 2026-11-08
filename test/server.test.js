@@ -200,3 +200,10 @@ test('报价开发默认开启、生产显式开启，拒绝拼写错误的开�
   assert.equal(loadConfig({ ...production, ORDER_QUOTE_REQUIRED: 'true' }).requiresQuote, true);
   assert.throws(() => loadConfig({ ORDER_QUOTE_REQUIRED: 'yes' }), /ORDER_QUOTE_REQUIRED/);
 });
+
+test('服务商退款默认关闭，显式开启并校验配置值', () => {
+  assert.equal(loadConfig({}).refundEnabled, false);
+  assert.equal(loadConfig({ ORDER_REFUND_ENABLED: 'false' }).refundEnabled, false);
+  assert.equal(loadConfig({ ORDER_REFUND_ENABLED: 'true' }).refundEnabled, true);
+  assert.throws(() => loadConfig({ ORDER_REFUND_ENABLED: 'yes' }), /ORDER_REFUND_ENABLED/);
+});

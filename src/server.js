@@ -1,6 +1,7 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { OrderService } from './order-service.js';
 import { ChannelService } from './channel-service.js';
+import { RefundService } from './refund-service.js';
 import { FulfillmentDispatcher, createFulfillmentClient } from './fulfillment.js';
 import { FulfillmentSynchronizer } from './fulfillment-sync.js';
 import { createServer } from 'node:http';
@@ -45,6 +46,7 @@ export function createApp({ config = loadConfig(), store = new SQLiteStore(confi
   const searchProducts = catalogClient || createCatalogClient(config);
   const channels = new ChannelService(store, service, now);
   const timely = fulfillmentClient ?? createFulfillmentClient(config, fetch, now);
+  const refunds = new RefundService(orders, timely?.refunds, config.refundEnabled);
   const synchronizer = new FulfillmentSynchronizer(orders, timely);
   const dispatcher = new FulfillmentDispatcher(orders, timely, { allowRetry: config.timelyIdempotency === true, onCreated:id=>synchronizer.refresh(id,{force:true}) });
   const rate = new Map();
@@ -122,7 +124,9 @@ export function createApp({ config = loadConfig(), store = new SQLiteStore(confi
           if (request.method === 'PATCH' && accountMatch) return json(response, 200, channels.updateAccount(accountMatch[1], await body(request)));
           throw new AppError(404, '渠道管理接口不存在');
         }
-        const match = path.match(/^\/api\/order-management\/orders\/([^/]+)(?:\/(quote|receipt|reject-payment|review|fulfillment|link|payment-screenshot))?$/);
+        const confirmation = path.match(/^\/api\/order-management\/fulfillment-refunds\/([^/]+)\/confirm$/);
+        if (confirmation && request.method === 'POST') return json(response, 200, await refunds.confirm(confirmation[1], await body(request)));
+        const match = path.match(/^\/api\/order-management\/orders\/([^/]+)(?:\/(quote|receipt|reject-payment|review|fulfillment|link|payment-screenshot|refund-mark|refund-initiate))?$/);
         if (request.method === 'GET' && path === '/api/order-management/orders') {
           const query = Object.fromEntries(url.searchParams);
           const result = query.export === '1' ? orders.exportByDate(query) : orders.list(null, query);
@@ -131,9 +135,11 @@ export function createApp({ config = loadConfig(), store = new SQLiteStore(confi
         if (match && request.method === 'GET' && match[2] === 'payment-screenshot') return sendScreenshot(response, orders.getPaymentScreenshot(match[1]));
         if (match && request.method === 'GET' && !match[2]) {
           let order = orders.get(match[1]);
-          order = await synchronizer.refresh(order.id);
+          order = await refunds.refresh(await synchronizer.refresh(order.id));
           return json(response, 200, { order });
         }
+        if (match && request.method === 'POST' && match[2] === 'refund-mark') return json(response, 200, await refunds.mark(match[1], await body(request)));
+        if (match && request.method === 'POST' && match[2] === 'refund-initiate') return json(response, 200, await refunds.initiate(match[1], await body(request)));
         if (match && request.method === 'POST' && ['quote','receipt','reject-payment','review','fulfillment','link'].includes(match[2])) {
           const action = match[2] === 'reject-payment' ? 'rejectPayment' : match[2];
           const result = orders[action](match[1], await body(request, 65536));
@@ -152,10 +158,13 @@ export function createApp({ config = loadConfig(), store = new SQLiteStore(confi
         if (timely?.options) return json(response, 200, { ...(await timely.options()), requiresQuote });
         return json(response, 200, { demo: true, requiresQuote, cities: [{id:'preview-shanghai',name:'上海'},{id:'preview-hangzhou',name:'杭州'}], brands:[{id:'preview-brand',name:'示例品牌'}], platforms:[{id:'preview-meituan',name:'美团'},{id:'preview-eleme',name:'饿了么'},{id:'preview-other',name:'其他'}] });
       }
-      if (path === '/api/orders' || /^\/api\/orders\/[^/]+(?:\/(?:manual-payment|payment-screenshot))?$/.test(path)) {
+      if (path === '/api/orders' || /^\/api\/orders\/[^/]+(?:\/(?:manual-payment|payment-screenshot|refund-request))?$/.test(path)) {
         const account = service.authenticate(cookieToken(request));
         if (request.method === 'GET' && path.endsWith('/payment-screenshot')) return sendScreenshot(response, orders.getPaymentScreenshot(path.split('/').at(-2), account.id));
         if (request.method === 'POST' && path.endsWith('/manual-payment')) return json(response, 200, orders.submitManualPayment(path.split('/').at(-2), account, await body(request, 8 * 1024 * 1024)));
+        if (request.method === 'POST' && path.endsWith('/refund-request')) {
+          return json(response, 200, refunds.request(path.split('/').at(-2), account, await body(request), request.headers['idempotency-key']));
+        }
         if (request.method === 'GET' && path === '/api/orders') return json(response, 200, { ...orders.list(account.id, Object.fromEntries(url.searchParams)), requiresQuote });
         if (request.method === 'POST' && path === '/api/orders') {
           const result = orders.create(account, await body(request, 65536), request.headers['idempotency-key']);
@@ -164,7 +173,7 @@ export function createApp({ config = loadConfig(), store = new SQLiteStore(confi
         if (request.method === 'GET') {
           let order = orders.get(path.split('/').at(-1), account.id);
           order = await synchronizer.refresh(order.id);
-          return json(response, 200, { order });
+          return json(response, 200, { order, canRequestRefund: refunds.canRequest(order) });
         }
         throw new AppError(405, '发起方只能创建和查询订单');
       }
