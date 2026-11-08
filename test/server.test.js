@@ -191,3 +191,12 @@ test('生产强制 HTTPS 短信接口和 HTTPS 页面地址；开发验证码只
   const config = loadConfig({ NODE_ENV: 'production', DEBUG_SMS_HOST: 'https://sms.example.com', APP_ORIGIN: 'https://accounts.example.com' });
   assert.equal(config.smsMode, 'remote');
 });
+
+test('报价开发默认开启、生产显式开启，拒绝拼写错误的开关', () => {
+  const production = { NODE_ENV: 'production', DEBUG_SMS_HOST: 'https://sms.example.com', APP_ORIGIN: 'https://accounts.example.com' };
+  assert.equal(loadConfig({}).requiresQuote, true);
+  assert.equal(loadConfig({ ORDER_QUOTE_REQUIRED: 'false' }).requiresQuote, false);
+  assert.equal(loadConfig(production).requiresQuote, false);
+  assert.equal(loadConfig({ ...production, ORDER_QUOTE_REQUIRED: 'true' }).requiresQuote, true);
+  assert.throws(() => loadConfig({ ORDER_QUOTE_REQUIRED: 'yes' }), /ORDER_QUOTE_REQUIRED/);
+});

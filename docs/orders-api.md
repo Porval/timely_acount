@@ -1,8 +1,8 @@
-# 手工订单、手动付款与管理端审核接口
+# 手工订单、报价、手动付款与管理端审核接口
 
 订单功能合并在 extrasAccount，继续使用同一登录身份和 SQLite 数据库。extrasWeb 是发起方页面，已有管理端由它自己的服务器调用下列管理接口；本项目不建设管理端页面，也不提供线上支付。
 
-业务流程：手工建单 → 提交手动付款信息 → 管理端确认收款（资料有误可退回重提）→ 管理端审核 → 本后台调用履约接口建单 → Web 查看履约。
+启用报价后的业务流程：手工建单 → 管理端报价 → 提交手动付款信息 → 管理端确认收款（资料有误可退回重提）→ 管理端审核 → 本后台调用履约接口建单 → Web 查看履约。
 
 `order.id` 是本项目结算订单 ID，`referenceId` 是选填的外部订单号（省略或空字符串表示未填写），`external.timelyOrderId` 是审核通过后关联的履约订单 ID。所有本项目 API 金额均为整数分，时间均为 Unix 毫秒。
 
@@ -12,13 +12,13 @@
 
 | 方法 | 路径 | 功能 |
 | --- | --- | --- |
-| GET | `/api/order-options` | 城市、品牌、平台；`demo:true` 表示测试目录 |
+| GET | `/api/order-options` | 城市、品牌、平台；`requiresQuote` 表示新单是否需报价，`demo:true` 表示测试目录 |
 | POST | `/api/orders` | 手工创建；必须带唯一 `Idempotency-Key` 请求头 |
-| GET | `/api/orders` | 当前账号订单；支持 page/pageSize/date/contacts/reference/item/stage |
+| GET | `/api/orders` | 当前账号订单；支持 page/pageSize/date/contacts/reference/item/stage/quoteStatus；顶层返回布尔值 `requiresQuote` |
 | GET | `/api/orders/:id` | 当前账号订单详情及最新履约情况 |
 | POST | `/api/orders/:id/manual-payment` | 提交手动付款信息；不代表确认收款 |
 
-建单示例，`Idempotency-Key` 建议为 UUID；网络重试必须使用相同编号和内容：
+启用报价时的建单示例，`Idempotency-Key` 建议为 UUID；网络重试必须使用相同编号和内容：
 
 ```json
 {
@@ -27,13 +27,15 @@
   "plateId": "实际平台ID", "platformName": "美团",
   "items": [{ "itemName": "商品", "spec": "500g", "salesPrice": 1234, "quantity": 2 }],
   "contacts": "收件人、手机号和完整地址", "messages": "配送备注",
-  "referenceId": "外部订单号（选填）", "payPrice": 2468, "arrivedTime": 30
+  "referenceId": "外部订单号（选填）", "arrivedTime": 30
 }
 ```
 
 返回 `{ "order": {...}, "created": true }`；同一建单请求重试返回同一订单及 `created:false`。填写外部订单号时，同一个账号不能重复创建相同编号；未填写时可创建多笔订单。履约系统需要关联编号时，后台使用本项目订单 ID，不会伪造用户的外部订单号。
 
-提交手动付款信息：
+当 `requiresQuote=true`，服务商无需填写应付金额；后端忽略传入的 `payPrice`，保存 `quote:{"status":"pending"}` 与占位的 `payPrice:0`，进度为待报价。商品单价仅供报价参考。报价成功后，订单返回 `quote.status=quoted`，应付金额由管理端报价写入。服务商列表和详情使用当前登录账号读取报价。列表返回的 `requiresQuote` 表示新建订单当前是否需报价；关闭开关后仍可查询已有的待报价订单。未开启报价时，仍需传入大于零的 `payPrice`。历史订单不追加报价要求。
+
+提交手动付款信息（待报价订单返回 409）：
 
 ```json
 { "reference": "银行或支付平台流水号", "description": "手动付款说明", "screenshot": { "contentType": "image/png", "data": "原图纯base64内容" } }
@@ -54,8 +56,9 @@ Content-Type: application/json
 
 | 方法 | 路径 | 功能 |
 | --- | --- | --- |
-| GET | `/api/order-management/orders` | 管理端查询订单；支持 `reviewStatus=pending` 与分页 |
+| GET | `/api/order-management/orders` | 管理端查询订单；支持分页、`reviewStatus`、`stage=待报价`、`quoteStatus=pending\|quoted` |
 | GET | `/api/order-management/orders/:id` | 查询订单、付款信息和审核状态 |
+| POST | `/api/order-management/orders/:id/quote` | 提交整单报价，待报价订单仅能报价一次 |
 | POST | `/api/order-management/orders/:id/receipt` | 确认实际收款，建议始终携带当前 noteId |
 | POST | `/api/order-management/orders/:id/reject-payment` | 收款前退回付款资料，必须填写原因，可由原账号重新提交 |
 | POST | `/api/order-management/orders/:id/review` | 审核结果；通过后后台自动发起履约建单 |
@@ -64,13 +67,21 @@ Content-Type: application/json
 
 `eventId` 是管理端的唯一事件编号。同一事件重发相同内容返回 `replayed:true`；同编号不同内容返回 409。事件和订单状态在同一数据库事务中保存。
 
+### 报价
+
+```json
+{ "eventId": "quote-20261108-001", "amount": 2468, "note": "报价说明（选填）", "quotedBy": "管理端报价人员" }
+```
+
+金额使用整数分，范围 1 至 99999999；备注最多 1000 字。管理端桥接层根据登录身份写入 `quotedBy`，后台生成报价时间。成功返回 `{order,replayed}`：`quote` 包含 `status: "quoted"`、`amount`、`note`、`quotedAt`、`quotedBy`，同时更新 `payPrice=amount`。新事件不能覆盖报价；同一事件可重试。报价不确认收款、不提交审核。
+
 ### 1. 确认实际收款
 
 ```json
 { "eventId": "receipt-20261008-001", "noteId": "当前 payment.noteId", "transactionId": "实际收款流水号", "amount": 2468, "collectedAt": 1791460800000 }
 ```
 
-金额必须等于订单应付金额，同一收款流水不能用于两个订单。`noteId` 提供时必须匹配当前付款资料，并参与事件内容幂等校验。经历过付款资料退回的订单，首次确认必须处于 `submitted` 且携带正确 `noteId`，避免陈旧页面确认新一轮付款；从未退回的旧集成可继续省略 `noteId`、直接确认未提交付款资料的订单。`collectedAt` 表示真实到账时间，可早于提交或重提资料时间，继续沿用原时间格式和未来时间校验。收款后页面显示已收款待审核，此时不调用履约建单接口。
+金额必须等于订单应付金额，同一收款流水不能用于两个订单。`noteId` 提供时必须匹配当前付款资料，并参与事件内容幂等校验。经历过付款资料退回的订单，首次确认必须处于 `submitted` 且携带正确 `noteId`，避免陈旧页面确认新一轮付款；报价订单必须已报价且服务商已提交付款资料。从未退回的历史或兼容模式订单可继续省略 `noteId`、直接确认未提交付款资料的订单。`collectedAt` 表示真实到账时间，可早于提交或重提资料时间，继续沿用原时间格式和未来时间校验。收款后页面显示已收款待审核，此时不调用履约建单接口。
 
 ### 1.1 收款前退回付款资料
 
@@ -115,6 +126,10 @@ Content-Type: application/json
 ```
 
 只允许收款并审核通过的订单；不能覆盖已有不同 ID，不能将同一履约订单关联两个结算订单。
+
+## 报价上线配置
+
+`ORDER_QUOTE_REQUIRED` 仅接受 `true` 或 `false`。未设置时，开发环境开启，生产环境保持原建单流程。两个前端均发布且报价页面可用后，在后台设置 `ORDER_QUOTE_REQUIRED=true` 并重启。关闭开关只影响此后新建的订单，已有报价订单仍按各自的报价状态完成后续流程。无需变更数据库表结构。
 
 ## 履约配置
 

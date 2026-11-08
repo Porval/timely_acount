@@ -40,7 +40,8 @@ function setSession(response, token, expiresAt, config) {
 }
 export function createApp({ config = loadConfig(), store = new SQLiteStore(config.databaseFile, { legacyFile: config.legacyFile }), sendSms = createSmsSender(config), verifySms = createSmsVerifier(config), now = Date.now, fulfillmentClient, catalogClient } = {}) {
   const service = new AccountService({ store, sendSms, verifySms, now });
-  const orders = new OrderService(store, now);
+  const requiresQuote = config.requiresQuote === true;
+  const orders = new OrderService(store, now, { requiresQuote });
   const searchProducts = catalogClient || createCatalogClient(config);
   const channels = new ChannelService(store, service, now);
   const timely = fulfillmentClient ?? createFulfillmentClient(config, fetch, now);
@@ -121,7 +122,7 @@ export function createApp({ config = loadConfig(), store = new SQLiteStore(confi
           if (request.method === 'PATCH' && accountMatch) return json(response, 200, channels.updateAccount(accountMatch[1], await body(request)));
           throw new AppError(404, '渠道管理接口不存在');
         }
-        const match = path.match(/^\/api\/order-management\/orders\/([^/]+)(?:\/(receipt|reject-payment|review|fulfillment|link|payment-screenshot))?$/);
+        const match = path.match(/^\/api\/order-management\/orders\/([^/]+)(?:\/(quote|receipt|reject-payment|review|fulfillment|link|payment-screenshot))?$/);
         if (request.method === 'GET' && path === '/api/order-management/orders') return json(response, 200, orders.list(null, Object.fromEntries(url.searchParams)));
         if (match && request.method === 'GET' && match[2] === 'payment-screenshot') return sendScreenshot(response, orders.getPaymentScreenshot(match[1]));
         if (match && request.method === 'GET' && !match[2]) {
@@ -129,7 +130,7 @@ export function createApp({ config = loadConfig(), store = new SQLiteStore(confi
           order = await synchronizer.refresh(order.id);
           return json(response, 200, { order });
         }
-        if (match && request.method === 'POST' && ['receipt','reject-payment','review','fulfillment','link'].includes(match[2])) {
+        if (match && request.method === 'POST' && ['quote','receipt','reject-payment','review','fulfillment','link'].includes(match[2])) {
           const action = match[2] === 'reject-payment' ? 'rejectPayment' : match[2];
           const result = orders[action](match[1], await body(request, 65536));
           if (match[2] === 'review') queueMicrotask(() => dispatcher.runOnce());
@@ -144,14 +145,14 @@ export function createApp({ config = loadConfig(), store = new SQLiteStore(confi
       if (path === '/api/order-options') {
         service.authenticate(cookieToken(request));
         if (request.method !== 'GET') throw new AppError(405, '请求方法不支持');
-        if (timely?.options) return json(response, 200, await timely.options());
-        return json(response, 200, { demo: true, cities: [{id:'preview-shanghai',name:'上海'},{id:'preview-hangzhou',name:'杭州'}], brands:[{id:'preview-brand',name:'示例品牌'}], platforms:[{id:'preview-meituan',name:'美团'},{id:'preview-eleme',name:'饿了么'},{id:'preview-other',name:'其他'}] });
+        if (timely?.options) return json(response, 200, { ...(await timely.options()), requiresQuote });
+        return json(response, 200, { demo: true, requiresQuote, cities: [{id:'preview-shanghai',name:'上海'},{id:'preview-hangzhou',name:'杭州'}], brands:[{id:'preview-brand',name:'示例品牌'}], platforms:[{id:'preview-meituan',name:'美团'},{id:'preview-eleme',name:'饿了么'},{id:'preview-other',name:'其他'}] });
       }
       if (path === '/api/orders' || /^\/api\/orders\/[^/]+(?:\/(?:manual-payment|payment-screenshot))?$/.test(path)) {
         const account = service.authenticate(cookieToken(request));
         if (request.method === 'GET' && path.endsWith('/payment-screenshot')) return sendScreenshot(response, orders.getPaymentScreenshot(path.split('/').at(-2), account.id));
         if (request.method === 'POST' && path.endsWith('/manual-payment')) return json(response, 200, orders.submitManualPayment(path.split('/').at(-2), account, await body(request, 8 * 1024 * 1024)));
-        if (request.method === 'GET' && path === '/api/orders') return json(response, 200, orders.list(account.id, Object.fromEntries(url.searchParams)));
+        if (request.method === 'GET' && path === '/api/orders') return json(response, 200, { ...orders.list(account.id, Object.fromEntries(url.searchParams)), requiresQuote });
         if (request.method === 'POST' && path === '/api/orders') {
           const result = orders.create(account, await body(request, 65536), request.headers['idempotency-key']);
           return json(response, result.created ? 201 : 200, result);

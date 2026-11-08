@@ -25,6 +25,7 @@ const integer = (value, label, min, max) => {
 };
 const digest = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 export function stage(order) {
+  if (order.quote?.status === 'pending') return '待报价';
   if (order.payment.status === 'submitted') return '待收款确认';
   if (order.payment.status !== 'paid') return '待付款';
   if (order.review.status === 'rejected') return '审核未通过';
@@ -36,7 +37,7 @@ export function stage(order) {
   if (order.fulfillment.status === 'delivered') return '已完成';
   return order.fulfillment.status === 'waiting' ? '待履约' : '履约中';
 }
-function validateOrder(input) {
+function validateOrder(input, requiresQuote) {
   if (!Array.isArray(input.items) || !input.items.length || input.items.length > 50) fail(400, '请填写 1 至 50 件商品');
   return {
     cityId: text(input.cityId, '城市 ID'), cityName: text(input.cityName, '城市', 80),
@@ -45,12 +46,15 @@ function validateOrder(input) {
     items: input.items.map(item => ({ itemName: text(item.itemName, '商品名称', 120), spec: text(item.spec, '规格', 120, true),
       salesPrice: integer(item.salesPrice, '商品单价（分）', 1, 99999999), quantity: integer(item.quantity, '商品数量', 1, 9999), ...(item.upc ? {upc:text(item.upc,'UPC',80)} : {}), ...(item.catalogId ? {catalogId:text(item.catalogId,'商品库 ID',120)} : {}), ...imageSnapshot(item.imageUrl) })),
     contacts: text(input.contacts, '收件信息', 1000), messages: text(input.messages, '备注', 1000, true),
-    referenceId: text(typeof input.referenceId === 'string' ? input.referenceId.trim() : input.referenceId, '外部订单号', 100, true), payPrice: integer(input.payPrice, '应付金额（分）', 1, 99999999),
+    referenceId: text(typeof input.referenceId === 'string' ? input.referenceId.trim() : input.referenceId, '外部订单号', 100, true), payPrice: requiresQuote ? 0 : integer(input.payPrice, '应付金额（分）', 1, 99999999),
     arrivedTime: integer(input.arrivedTime, '送达时限', 1, 1440),
   };
 }
 export class OrderService {
-  constructor(accountStore, now = Date.now) { this.store = new OrderStore(accountStore); this.db = this.store.db; this.now = now; }
+  constructor(accountStore, now = Date.now, { requiresQuote = false } = {}) {
+    this.store = new OrderStore(accountStore); this.db = this.store.db; this.now = now;
+    this.requiresQuote = requiresQuote;
+  }
   event(order, title, description) { order.events.push({ id: randomUUID(), time: this.now(), title, description }); }
   get(id, ownerId) {
     const order = this.store.read(id);
@@ -62,17 +66,20 @@ export class OrderService {
     const pageSize = integer(Number(query.pageSize || 20), '每页数量', 1, 100);
     const reviewStatus = query.reviewStatus;
     if (reviewStatus && !['not_submitted', 'pending', 'approved', 'rejected'].includes(reviewStatus)) fail(400, '审核筛选状态不正确');
+    const quoteStatus = query.quoteStatus;
+    if (quoteStatus && !['pending', 'quoted'].includes(quoteStatus)) fail(400, '报价筛选状态不正确');
     const filters = []; const params = [];
     if (ownerId) { filters.push('owner_id=?'); params.push(ownerId); }
     if (reviewStatus) { filters.push("json_extract(data,'$.review.status')=?"); params.push(reviewStatus); }
+    if (quoteStatus) { filters.push("json_extract(data,'$.quote.status')=?"); params.push(quoteStatus); }
     for (const [field, expression] of [['contacts',"json_extract(data,'$.contacts')"], ['reference','reference_id']]) {
       if (query[field]) { const value = text(query[field], '筛选条件', 1000); filters.push(`instr(lower(${expression}),lower(?))>0`); params.push(value); }
     }
     if (query.item) { filters.push("EXISTS (SELECT 1 FROM json_each(json_extract(data,'$.items')) WHERE instr(lower(json_extract(value,'$.itemName') || ' ' || coalesce(json_extract(value,'$.spec'),'')),lower(?))>0)"); params.push(text(query.item,'商品筛选',120)); }
     if (query.date) { if (!/^\d{4}-\d{2}-\d{2}$/.test(query.date)) fail(400,'日期筛选格式不正确'); filters.push("date(created_at/1000,'unixepoch','+8 hours')=?"); params.push(query.date); }
     if (query.stage) {
-      if (!['待付款','待收款确认','已收款待审核','审核未通过','审核通过待建单','待履约','履约中','已完成','已退款','履约异常','已挂起'].includes(query.stage)) fail(400,'进度筛选不正确');
-      filters.push("CASE WHEN json_extract(data,'$.payment.status')='submitted' THEN '待收款确认' WHEN json_extract(data,'$.payment.status')!='paid' THEN '待付款' WHEN json_extract(data,'$.review.status')='rejected' THEN '审核未通过' WHEN json_extract(data,'$.review.status')!='approved' THEN '已收款待审核' WHEN json_extract(data,'$.external.status')!='created' THEN '审核通过待建单' WHEN json_extract(data,'$.fulfillment.sourceCode')=6 THEN '已退款' WHEN json_extract(data,'$.fulfillment.sourceCode')=8 OR json_extract(data,'$.fulfillment.errorOrder')=1 THEN '履约异常' WHEN json_extract(data,'$.fulfillment.hungup')=1 THEN '已挂起' WHEN json_extract(data,'$.fulfillment.status')='delivered' THEN '已完成' WHEN json_extract(data,'$.fulfillment.status')='waiting' THEN '待履约' ELSE '履约中' END=?"); params.push(query.stage);
+      if (!['待报价','待付款','待收款确认','已收款待审核','审核未通过','审核通过待建单','待履约','履约中','已完成','已退款','履约异常','已挂起'].includes(query.stage)) fail(400,'进度筛选不正确');
+      filters.push("CASE WHEN json_extract(data,'$.quote.status')='pending' THEN '待报价' WHEN json_extract(data,'$.payment.status')='submitted' THEN '待收款确认' WHEN json_extract(data,'$.payment.status')!='paid' THEN '待付款' WHEN json_extract(data,'$.review.status')='rejected' THEN '审核未通过' WHEN json_extract(data,'$.review.status')!='approved' THEN '已收款待审核' WHEN json_extract(data,'$.external.status')!='created' THEN '审核通过待建单' WHEN json_extract(data,'$.fulfillment.sourceCode')=6 THEN '已退款' WHEN json_extract(data,'$.fulfillment.sourceCode')=8 OR json_extract(data,'$.fulfillment.errorOrder')=1 THEN '履约异常' WHEN json_extract(data,'$.fulfillment.hungup')=1 THEN '已挂起' WHEN json_extract(data,'$.fulfillment.status')='delivered' THEN '已完成' WHEN json_extract(data,'$.fulfillment.status')='waiting' THEN '待履约' ELSE '履约中' END=?"); params.push(query.stage);
     }
     const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
     const total = this.db.prepare(`SELECT count(*) AS total FROM orders ${where}`).get(...params).total;
@@ -81,19 +88,25 @@ export class OrderService {
     return { orders, total, page, pageSize };
   }
   create(account, input, createKey) {
-    const payload = validateOrder(input); const key = text(createKey, 'Idempotency-Key', 120); const hash = digest(payload);
+    const key = text(createKey, 'Idempotency-Key', 120);
     return this.store.transaction(() => {
       const existing = this.db.prepare('SELECT id, create_hash FROM orders WHERE owner_id=? AND create_key=?').get(account.id, key);
       if (existing) {
+        const order = this.get(existing.id);
+        // A deployment can change the mode between the first request and a retry.
+        const hash = digest(validateOrder(input, Boolean(order.quote)));
         if (existing.create_hash !== hash) fail(409, '同一建单请求编号对应不同内容');
-        return { order: this.get(existing.id), created: false };
+        return { order, created: false };
       }
+      const payload = validateOrder(input, this.requiresQuote);
+      const hash = digest(payload);
       if (payload.referenceId && this.db.prepare('SELECT 1 FROM orders WHERE owner_id=? AND reference_id=?').get(account.id, payload.referenceId)) fail(409, '外部订单号已存在');
       const now = this.now();
       const order = { ...payload, id: randomUUID(), ownerId: account.id, operatorName: account.personName, providerName: account.providerName,
         createdAt: now, payment: { status: 'unpaid' }, review: { status: 'not_submitted' }, external: { status: 'not_created' },
-        fulfillment: { status: 'not_started' }, events: [] };
-      this.event(order, '手工创建订单', `${account.providerName} · ${account.personName} 创建订单，等待收款。`);
+        fulfillment: { status: 'not_started' }, events: [],
+        ...(this.requiresQuote ? { quote: { status: 'pending' } } : {}) };
+      this.event(order, '手工创建订单', `${account.providerName} · ${account.personName} 创建订单，${this.requiresQuote ? '等待管理端报价' : '等待收款'}。`);
       this.db.prepare('INSERT INTO orders(id,owner_id,reference_id,create_key,create_hash,data,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)')
         .run(order.id, account.id, order.referenceId || null, key, hash, JSON.stringify(order), now, now);
       return { order, created: true };
@@ -110,6 +123,7 @@ export class OrderService {
     const previousNoteId = input.previousNoteId === undefined ? undefined : text(input.previousNoteId, 'previousNoteId', 120);
     return this.store.transaction(() => {
       const order = this.get(id, account.id);
+      if (order.quote && order.quote.status !== 'quoted') fail(409, '订单尚未报价，报价后才可提交付款资料');
       if (order.payment.status === 'paid') fail(409, '已确认收款，不能重复提交付款信息');
       const hasRejections = Boolean(order.payment.rejections?.length);
       if (hasRejections) {
@@ -162,10 +176,28 @@ export class OrderService {
       return { order, replayed: false };
     });
   }
+  quote(id, input) {
+    const payload = {
+      amount: integer(input.amount, '报价金额（分）', 1, 99999999),
+      note: text(typeof input.note === 'string' ? input.note.trim() : input.note, '报价备注', 1000, true),
+      quotedBy: text(input.quotedBy, '报价人员', 80),
+    };
+    return this.receive(id, 'quote', input.eventId, payload, order => {
+      if (order.quote?.status !== 'pending' || order.payment.status !== 'unpaid' ||
+          order.review.status !== 'not_submitted' || order.external.status !== 'not_created') fail(409, '只有待报价订单可以提交报价');
+      order.quote = { status: 'quoted', ...payload, quotedAt: this.now() };
+      order.payPrice = payload.amount;
+      this.event(order, '管理端已报价', `${payload.quotedBy} 提交报价 ¥${(payload.amount / 100).toFixed(2)}${payload.note ? `：${payload.note}` : '，等待服务商付款。'}`);
+    });
+  }
   receipt(id, input) {
     const payload = { transactionId: text(input.transactionId, '收款流水号', 120), amount: integer(input.amount, '收款金额（分）', 1, 99999999),
       collectedAt: this.timestamp(input.collectedAt, '收款时间'), ...(input.noteId === undefined ? {} : { noteId: text(input.noteId, '付款资料编号', 120) }) };
     return this.receive(id, 'receipt', input.eventId, payload, order => {
+      if (order.quote) {
+        if (order.quote.status !== 'quoted') fail(409, '订单尚未报价，不能确认收款');
+        if (!['submitted', 'paid'].includes(order.payment.status)) fail(409, '请等待服务商提交付款资料后再确认收款');
+      }
       if (payload.noteId !== undefined && payload.noteId !== order.payment.noteId) fail(409, '付款资料已更新，请刷新订单后确认收款');
       if (order.payment.rejections?.length && (order.payment.status !== 'submitted' || !payload.noteId)) fail(409, '退回后的付款资料必须重新提交，并核对本次付款资料编号');
       if (this.db.prepare("SELECT id FROM orders WHERE json_extract(data,'$.payment.transactionId')=? AND id<>?").get(payload.transactionId, order.id)) fail(409, '该收款流水已用于其他订单');
