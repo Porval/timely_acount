@@ -41,52 +41,83 @@ test('订单实际入库、登录身份防伪、重复创建幂等和账号隔�
   assert.equal((await f.call('/api/orders')).status,401);
   assert.equal((await f.create({...input(),referenceId:'bad',payPrice:24.68},'other-key')).status,400);
 });
-test('管理端导出北京时间创建日的全部订单，忽略筛选分页且保持账号访问限制', async t => {
+test('管理端按北京时间创建日期范围导出，覆盖首尾两日、排除待报价并忽略筛选分页', async t => {
   const f = await fixture(t);
-  const day = '2026-11-08';
-  const midnight = Date.parse(day + 'T00:00:00+08:00');
+  const startDate = '2026-11-08';
+  const endDate = '2026-11-09';
+  const midnight = Date.parse(startDate + 'T00:00:00+08:00');
+  const secondMidnight = Date.parse(endDate + 'T00:00:00+08:00');
+  const nextMidnight = Date.parse('2026-11-10T00:00:00+08:00');
   let createdAt = midnight;
   const orders = new OrderService(f.store, () => createdAt);
-  const createAt = (time, owner, referenceId) => {
+  const quotingOrders = new OrderService(f.store, () => createdAt, { requiresQuote: true });
+  const createAt = (time, owner, referenceId, service = orders) => {
     createdAt = time;
-    return orders.create(owner, { ...input(), referenceId }, 'export-' + referenceId).order;
+    return service.create(owner, { ...input(), referenceId }, 'export-' + referenceId).order;
   };
   createAt(midnight - 1, f.owner, 'day-before');
   const first = createAt(midnight, f.owner, 'start-of-day');
-  const expected = [first];
+  const firstDayOrders = [first];
   for (let index = 1; index <= 101; index++) {
-    expected.push(createAt(midnight + index, index % 2 ? f.owner : f.other, 'order-' + index));
+    firstDayOrders.push(createAt(midnight + index, index % 2 ? f.owner : f.other, 'order-' + index));
   }
-  expected.push(createAt(midnight + 86400000 - 1, f.other, 'end-of-day'));
-  createAt(midnight + 86400000, f.owner, 'next-day');
+  const pending = createAt(secondMidnight - 2, f.owner, 'pending-quote', quotingOrders);
+  firstDayOrders.push(createAt(secondMidnight - 1, f.other, 'end-of-first-day'));
+  const second = createAt(secondMidnight, f.other, 'start-of-second-day', quotingOrders);
+  quotingOrders.quote(second.id, { eventId: 'day-quote', amount: 2468, quotedBy: '测试报价员' });
+  const last = createAt(nextMidnight - 1, f.other, 'end-of-second-day');
+  createAt(nextMidnight, f.owner, 'day-after');
   orders.submitManualPayment(first.id, f.owner, { reference: 'DAY-PAYMENT', screenshot });
-  orders.receipt(expected[1].id, { eventId: 'day-receipt', transactionId: 'DAY-RECEIPT', amount: 2468 });
+  orders.receipt(firstDayOrders[1].id, { eventId: 'day-receipt', transactionId: 'DAY-RECEIPT', amount: 2468 });
 
   const endpoint = '/api/order-management/orders';
-  const exportPath = endpoint + '?date=' + day + '&export=1&stage=待报价&page=2&pageSize=1&reference=未匹配&contacts=未匹配';
+  const rangeQuery = '&startDate=' + startDate + '&endDate=' + endDate;
+  const filters = '&stage=待报价&quoteStatus=pending&page=2&pageSize=1&reference=未匹配&contacts=未匹配';
+  const exportPath = endpoint + '?export=1' + rangeQuery + filters;
   assert.equal((await f.call(exportPath, { cookie: f.cookie })).status, 401);
   const exported = await f.call(exportPath, { management: true });
   assert.equal(exported.status, 200);
-  assert.deepEqual(Object.keys(exported.data).sort(), ['orders', 'total']);
+  assert.deepEqual(Object.keys(exported.data).sort(), ['endDate', 'orders', 'startDate', 'total']);
+  assert.equal(exported.data.startDate, startDate);
+  assert.equal(exported.data.endDate, endDate);
+  const expected = [...firstDayOrders, second, last];
   assert.equal(exported.data.total, expected.length);
   assert.deepEqual(exported.data.orders.map(order => order.id), [...expected].reverse().map(order => order.id));
   assert.deepEqual(new Set(exported.data.orders.map(order => order.payment.status)), new Set(['unpaid', 'paid', 'submitted']));
+  assert.equal(exported.data.orders[1].quote.status, 'quoted');
 
-  const managementList = await f.call(endpoint + '?date=' + day + '&stage=付款待审核', { management: true });
+  const singleDay = await f.call(endpoint + '?export=1&date=' + startDate + filters, { management: true });
+  assert.equal(singleDay.status, 200);
+  assert.deepEqual(Object.keys(singleDay.data).sort(), ['orders', 'total']);
+  assert.equal(singleDay.data.total, firstDayOrders.length);
+  assert.deepEqual(singleDay.data.orders.map(order => order.id), [...firstDayOrders].reverse().map(order => order.id));
+  const sameDayRange = await f.call(endpoint + '?export=1&startDate=' + startDate + '&endDate=' + startDate, { management: true });
+  assert.deepEqual(sameDayRange.data, { ...singleDay.data, startDate, endDate: startDate });
+
+  const managementList = await f.call(endpoint + '?date=' + startDate + '&stage=付款待审核' + rangeQuery, { management: true });
   assert.deepEqual(managementList.data.orders.map(order => order.id), [first.id]);
-  const providerList = await f.call('/api/orders?date=' + day + '&export=1&pageSize=1', { cookie: f.cookie });
-  const owned = expected.filter(order => order.ownerId === f.owner.id);
+  const pendingList = await f.call(endpoint + '?date=' + startDate + '&stage=待报价', { management: true });
+  assert.deepEqual(pendingList.data.orders.map(order => order.id), [pending.id]);
+  const providerList = await f.call('/api/orders?date=' + startDate + '&export=1&pageSize=1' + rangeQuery, { cookie: f.cookie });
+  const owned = [...firstDayOrders, pending].filter(order => order.ownerId === f.owner.id);
   assert.equal(providerList.status, 200);
   assert.equal(providerList.data.total, owned.length);
   assert.equal(providerList.data.orders.length, 1);
   assert.equal(providerList.data.orders[0].ownerId, f.owner.id);
 
-  for (const date of ['', '2026-02-30', '2026-13-01', '2026-1-08']) {
-    assert.equal((await f.call(endpoint + '?export=1&date=' + date, { management: true })).status, 400);
+  const invalidQueries = [
+    '', '&date=', '&date=2026-02-30', '&date=2026-13-01', '&date=2026-1-08',
+    '&startDate=' + startDate, '&endDate=' + endDate, '&startDate=&endDate=' + endDate,
+    '&startDate=2026-02-30&endDate=' + endDate, '&startDate=' + startDate + '&endDate=2026-11-31',
+    '&startDate=' + endDate + '&endDate=' + startDate,
+    '&date=' + startDate + '&startDate=' + startDate,
+  ];
+  for (const query of invalidQueries) {
+    assert.equal((await f.call(endpoint + '?export=1' + query, { management: true })).status, 400, query);
   }
   assert.equal((await f.call('/api/orders?date=2026-02-30', { cookie: f.cookie })).status, 400);
-  const empty = await f.call(endpoint + '?export=1&date=2026-11-10', { management: true });
-  assert.deepEqual(empty.data, { orders: [], total: 0 });
+  const empty = await f.call(endpoint + '?export=1&startDate=2026-11-11&endDate=2026-11-12', { management: true });
+  assert.deepEqual(empty.data, { orders: [], total: 0, startDate: '2026-11-11', endDate: '2026-11-12' });
 });
 test('手动付款提交不代表到账，只有管理端能确认收款并创建唯一任务',async t=>{
   const f=await fixture(t);const order=(await f.create()).data.order;

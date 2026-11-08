@@ -59,7 +59,8 @@ Content-Type: application/json
 | 方法 | 路径 | 功能 |
 | --- | --- | --- |
 | GET | `/api/order-management/orders` | 管理端查询订单，支持分页、`date`、`reviewStatus`、`stage=待报价`、`quoteStatus=pending\|quoted` |
-| GET | `/api/order-management/orders?date=YYYY-MM-DD&export=1` | 按北京时间的创建日期导出当日全部订单 |
+| GET | `/api/order-management/orders?export=1&startDate=YYYY-MM-DD&endDate=YYYY-MM-DD` | 按北京时间的创建日期范围导出，排除待报价订单 |
+| GET | `/api/order-management/orders?date=YYYY-MM-DD&export=1` | 兼容单日导出，排除待报价订单 |
 | GET | `/api/order-management/orders/:id` | 查询订单、付款信息和履约进度 |
 | POST | `/api/order-management/orders/:id/quote` | 提交整单报价，待报价订单仅能报价一次 |
 | POST | `/api/order-management/orders/:id/receipt` | 确认实际到账并自动发起履约建单，建议始终携带当前 noteId |
@@ -70,7 +71,9 @@ Content-Type: application/json
 
 `eventId` 是管理端的唯一事件编号。同一事件重发相同内容返回 `replayed:true`；同编号不同内容返回 409。事件和订单状态在同一数据库事务中保存。
 
-导出要求填写有效创建日期，按创建时间倒序返回 `{ orders, total }`，范围为该日期北京时间零点到次日零点前。导出覆盖该日所有状态和服务商，忽略分页与其他筛选。服务商端仍按账号分页查询。
+范围导出要求同时传有效的 `startDate` 和 `endDate`，允许同一天，开始日期须早于或等于结束日期。按创建时间倒序返回 `{ orders, total, startDate, endDate }`，包含北京时间的开始日和结束日。传入任一范围参数时按范围校验，两者均未传时兼容 `date` 单日查询，返回 `{ orders, total }`。
+
+导出覆盖所有服务商，跳过 `quote.status=pending` 的待报价订单，兼容没有报价字段的历史订单。导出查询忽略分页和其他列表筛选。
 
 ### 报价
 

@@ -24,13 +24,13 @@ const integer = (value, label, min, max) => {
   return value;
 };
 const digest = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
-const createdOnDate = 'created_at >= ? AND created_at < ?';
-function creationDateRange(date) {
+const createdInRange = 'created_at >= ? AND created_at < ?';
+const dayMs = 24 * 3600000;
+function creationDayStart(date) {
   if (typeof date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(date)) fail(400, '请选择有效的订单创建日期');
   const midnightUtc = new Date(date + 'T00:00:00Z');
   if (!Number.isFinite(midnightUtc.getTime()) || midnightUtc.toISOString().slice(0, 10) !== date) fail(400, '请选择有效的订单创建日期');
-  const midnightBeijing = midnightUtc.getTime() - 8 * 3600000;
-  return [midnightBeijing, midnightBeijing + 24 * 3600000];
+  return midnightUtc.getTime() - 8 * 3600000;
 }
 const filterStages = new Set([
   '待报价', '待付款', '付款待审核', '待接单', '已接单', '配送中', '已完成', '履约异常', '已挂起', '已退款',
@@ -96,8 +96,9 @@ export class OrderService {
     }
     if (query.item) { filters.push("EXISTS (SELECT 1 FROM json_each(json_extract(data,'$.items')) WHERE instr(lower(json_extract(value,'$.itemName') || ' ' || coalesce(json_extract(value,'$.spec'),'')),lower(?))>0)"); params.push(text(query.item,'商品筛选',120)); }
     if (query.date) {
-      filters.push(createdOnDate);
-      params.push(...creationDateRange(query.date));
+      const start = creationDayStart(query.date);
+      filters.push(createdInRange);
+      params.push(start, start + dayMs);
     }
     if (query.stage) {
       const stages = legacyStageFilters.get(query.stage) || [query.stage];
@@ -125,11 +126,16 @@ export class OrderService {
       .all(...params, pageSize, (page - 1) * pageSize).map(row => JSON.parse(row.data));
     return { orders, total, page, pageSize };
   }
-  exportByDate(date) {
-    const range = creationDateRange(date);
-    const orders = this.db.prepare('SELECT data FROM orders WHERE ' + createdOnDate + ' ORDER BY created_at DESC, rowid DESC')
-      .all(...range).map(row => JSON.parse(row.data));
-    return { orders, total: orders.length };
+  exportByDate({ date, startDate, endDate }) {
+    const hasRange = startDate !== undefined || endDate !== undefined;
+    const start = creationDayStart(hasRange ? startDate : date);
+    const end = hasRange ? creationDayStart(endDate) : start;
+    if (start > end) fail(400, '开始日期不能晚于结束日期');
+
+    const orders = this.db.prepare("SELECT data FROM orders WHERE " + createdInRange +
+      " AND json_extract(data,'$.quote.status') IS NOT 'pending' ORDER BY created_at DESC, rowid DESC")
+      .all(start, end + dayMs).map(row => JSON.parse(row.data));
+    return { orders, total: orders.length, ...(hasRange ? { startDate, endDate } : {}) };
   }
   create(account, input, createKey) {
     const key = text(createKey, 'Idempotency-Key', 120);

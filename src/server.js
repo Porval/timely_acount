@@ -125,7 +125,7 @@ export function createApp({ config = loadConfig(), store = new SQLiteStore(confi
         const match = path.match(/^\/api\/order-management\/orders\/([^/]+)(?:\/(quote|receipt|reject-payment|review|fulfillment|link|payment-screenshot))?$/);
         if (request.method === 'GET' && path === '/api/order-management/orders') {
           const query = Object.fromEntries(url.searchParams);
-          const result = query.export === '1' ? orders.exportByDate(query.date) : orders.list(null, query);
+          const result = query.export === '1' ? orders.exportByDate(query) : orders.list(null, query);
           return json(response, 200, result);
         }
         if (match && request.method === 'GET' && match[2] === 'payment-screenshot') return sendScreenshot(response, orders.getPaymentScreenshot(match[1]));
