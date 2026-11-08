@@ -446,13 +446,14 @@ test('订单商品图片快照入库，列表详情及重启读取保持图片�
     assert.equal((await f.create({...input(),items:[{...input().items[0],imageUrl}]},'unsafe-image')).status,400);
   }
 });
-test('商品展示图片不改变履约系统接收的商品字段',async()=>{
-  const original=input(),items=original.items.map(item=>({...item,imageUrl:'https://cdn.example/product.jpg'}));
+test('履约建单传递商品图片快照，手工商品仍可无图',async()=>{
+  const original=input();
+  const items=[{...original.items[0],imageUrl:'https://cdn.example/product.jpg'}, {...original.items[0],itemName:'手工商品'}];
   const config={timelyHost:'http://127.0.0.1:9/',timelyKey:'key',timelySecret:'secret',timelyService:'service',timelyCreator:'creator'};
   let sent;
   const client=createFulfillmentClient(config,async(url,options)=>{sent=JSON.parse(options.body);return {ok:true,json:async()=>({id:'mock-order'})}});
   await client({...original,items,providerName:'测试'},'mock-job');
-  assert.deepEqual(JSON.parse(sent.items),original.items);assert.equal(items[0].imageUrl,'https://cdn.example/product.jpg');
+  assert.deepEqual(JSON.parse(sent.items),items);
 });
 
 test('服务商与管理端接口均返回同步的备注配送信息，其他账号不能触发或读取',async t=>{

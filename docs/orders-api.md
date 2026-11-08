@@ -205,7 +205,7 @@ POST /api/orders/:id/manual-payment 新增必填 screenshot：{contentType: 'ima
 
 多个关键词用空格分隔，统一字符宽度和大小写、去重后逐词匹配。后台优先用最长的非容量词查询候选商品，每批最多 100 条，再从商品索引、名称、品牌、规格等字段筛出命中全部词的商品。返回 `{products,page,hasMore}`，每页最多 20 条。扫描最多 8 批或 8 秒，达到上限且无法确认剩余匹配时返回 `limited:true`。商品库故障返回查询错误。`STANDARD_ITEM_HOST`、`STANDARD_ITEM_KEY`、`STANDARD_ITEM_SECRET` 由后台配置。
 
-商品包含 `id`、`name`、`upc`、`spec`、`price`（整数分或 `null`）、`brandId`、`brandName`、`imageUrl`（HTTPS 主图或空字符串）。订单商品可携带 `upc`、`catalogId`、`imageUrl` 作为快照。图片地址选填，最长 2048 字符，随订单入库并在列表和详情返回。建单人确认单价。
+商品包含 `id`、`name`、`upc`、`spec`、`price`（整数分或 `null`）、`brandId`、`brandName`、`imageUrl`（HTTPS 主图或空字符串）。订单商品可携带 `upc`、`catalogId`、`imageUrl` 作为快照。图片地址选填，最长 2048 字符，随订单入库并在列表和详情返回。创建履约单时会把已保存的图片地址随商品一起传给履约系统。建单人确认单价。
 
 
 ## 履约状态、备注与配送信息同步

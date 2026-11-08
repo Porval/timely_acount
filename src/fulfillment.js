@@ -13,7 +13,7 @@ export function createFulfillmentClient(config, fetchImpl = fetch, now = Date.no
     if ([order.cityId, order.brandId, order.plateId].some(id => id.startsWith('preview-'))) throw new Error('示例目录订单不能发送到履约系统，请配置真实城市、品牌与平台');
     if (config.timelyPlatform && order.plateId !== config.timelyPlatform) throw new Error('订单平台与配置的平台服务商不匹配');
     const data = signParams({ cityId: order.cityId, brandId: order.brandId, plateFormId: order.plateId,
-      items: JSON.stringify(order.items.map(({ imageUrl, ...item }) => item)), contacts: order.contacts, messages: order.messages, referenceId: order.referenceId || order.id,
+      items: JSON.stringify(order.items), contacts: order.contacts, messages: order.messages, referenceId: order.referenceId || order.id,
       payPrice: order.payPrice / 100, arrivedTime: order.arrivedTime, orderPrice: 0, shopName: order.providerName,
       creatorId: config.timelyCreator, plateFormServerId: config.timelyService }, config.timelyKey, config.timelySecret, now);
     const response = await fetchImpl(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': jobId },
