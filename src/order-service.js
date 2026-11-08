@@ -152,7 +152,7 @@ export class OrderService {
     return this.receive(id, 'reject-payment', input.eventId, payload, order => {
       if (order.payment.status !== 'submitted' || order.payment.noteId !== payload.noteId) fail(409, '付款资料已更新或不在待收款确认状态，请刷新订单');
       if (payload.rejectedAt < order.payment.submittedAt) fail(409, '退回时间不能早于付款资料提交时间');
-      if (order.review.status !== 'not_submitted' || order.external.status !== 'not_created') fail(409, '订单已经进入收款审核流程，不能退回付款资料');
+      if (order.review.status !== 'not_submitted' || order.external.status !== 'not_created') fail(409, '订单已进入后续处理，不能退回付款资料');
       const previous = order.payment;
       const rejected = { ...payload, reference: previous.reference, description: previous.description, screenshot: previous.screenshot,
         submittedAt: previous.submittedAt, payerId: previous.payerId, payerName: previous.payerName };
@@ -207,8 +207,10 @@ export class OrderService {
         return;
       }
       order.payment = { ...order.payment, status: 'paid', ...payload, paidAt: payload.collectedAt, payerId: order.ownerId, payerName: order.operatorName };
-      order.review = { status: 'pending' };
-      this.event(order, '确认收款', `收到管理端收款结果，金额 ${payload.amount} 分，等待审核。`);
+      // The approved marker keeps the original fulfillment guard and history format compatible.
+      order.review = { status: 'approved' };
+      this.event(order, '确认收款', `管理端确认实际到账 ${payload.amount} 分，系统将自动创建履约订单。`);
+      this.queueFulfillment(order);
     });
   }
   review(id, input) {
@@ -222,18 +224,19 @@ export class OrderService {
       if (order.review.status !== 'pending') fail(409, '订单已有审核结果');
       order.review = { ...payload, resultId: input.eventId };
       this.event(order, payload.status === 'approved' ? '管理端审核通过' : '管理端审核未通过', `${payload.reviewerName}：${payload.reason || '收款审核通过'}`);
-      if (payload.status === 'approved') {
-        order.external = { status: 'queued' };
-        this.db.prepare("INSERT INTO fulfillment_jobs(id,order_id,status,created_at,updated_at) VALUES(?,?,'pending',?,?)")
-          .run(`fulfillment-${order.id}`, order.id, this.now(), this.now());
-        this.event(order, '等待创建履约订单', '审核通过后，由本后台向履约系统发起建单。');
-      }
+      if (payload.status === 'approved') this.queueFulfillment(order);
     });
+  }
+  queueFulfillment(order) {
+    order.external = { status: 'queued' };
+    const now = this.now();
+    this.db.prepare("INSERT INTO fulfillment_jobs(id,order_id,status,created_at,updated_at) VALUES(?,?,'pending',?,?)")
+      .run(`fulfillment-${order.id}`, order.id, now, now);
   }
   link(id, input) {
     const payload = { timelyOrderId: text(input.timelyOrderId, '履约订单号', 120), description: text(input.description, '关联说明', 1000) };
     return this.receive(id, 'link', input.eventId, payload, order => {
-      if (order.payment.status !== 'paid' || order.review.status !== 'approved') fail(409, '收款并审核通过后才可关联履约订单');
+      if (order.payment.status !== 'paid' || order.review.status !== 'approved') fail(409, '确认到账并放行履约后才可关联履约订单');
       if (order.external.timelyOrderId) { if (order.external.timelyOrderId !== payload.timelyOrderId) fail(409,'已关联其他履约订单'); return; }
       if (this.db.prepare('SELECT id FROM orders WHERE timely_order_id=? AND id<>?').get(payload.timelyOrderId,order.id)) fail(409,'履约订单已关联其他结算订单');
       order.external = {status:'created',timelyOrderId:payload.timelyOrderId,createdAt:this.now()};
@@ -279,7 +282,7 @@ export class OrderService {
     const sequence = ['not_started', 'waiting', 'accepted', 'delivering', 'delivered'];
     if (!sequence.slice(1).includes(payload.status)) fail(400, '履约状态不正确');
     return this.receive(id, 'fulfillment', input.eventId, payload, order => {
-      if (order.review.status !== 'approved' || order.external.status !== 'created') fail(409, '审核通过并创建履约订单后才可同步进度');
+      if (order.review.status !== 'approved' || order.external.status !== 'created') fail(409, '创建履约订单后才可同步进度');
       if (order.external.timelyOrderId !== payload.timelyOrderId) fail(409, '履约订单号不匹配');
       if (payload.occurredAt < order.fulfillment.updatedAt || sequence.indexOf(payload.status) < sequence.indexOf(order.fulfillment.status)) fail(409, '履约进度不能回退');
       order.fulfillment = { ...order.fulfillment, status: payload.status, updatedAt: payload.occurredAt };

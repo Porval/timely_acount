@@ -133,7 +133,7 @@ export function createApp({ config = loadConfig(), store = new SQLiteStore(confi
         if (match && request.method === 'POST' && ['quote','receipt','reject-payment','review','fulfillment','link'].includes(match[2])) {
           const action = match[2] === 'reject-payment' ? 'rejectPayment' : match[2];
           const result = orders[action](match[1], await body(request, 65536));
-          if (match[2] === 'review') queueMicrotask(() => dispatcher.runOnce());
+          if (match[2] === 'receipt' || match[2] === 'review') queueMicrotask(() => dispatcher.runOnce());
           return json(response, 200, result);
         }
         throw new AppError(404, '管理端订单接口不存在');

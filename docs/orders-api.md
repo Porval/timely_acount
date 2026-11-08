@@ -1,10 +1,10 @@
-# 手工订单、报价、手动付款与管理端审核接口
+# 手工订单、报价、手动付款与到账确认接口
 
 订单功能合并在 extrasAccount，继续使用同一登录身份和 SQLite 数据库。extrasWeb 是发起方页面，已有管理端由它自己的服务器调用下列管理接口；本项目不建设管理端页面，也不提供线上支付。
 
-启用报价后的业务流程：手工建单 → 管理端报价 → 提交手动付款信息 → 管理端确认收款（资料有误可退回重提）→ 管理端审核 → 本后台调用履约接口建单 → Web 查看履约。
+启用报价后，服务商手工建单，管理端报价，服务商付款并提交资料，管理端确认到账。到账后后台自动建单，服务商可查看履约。付款资料有误时可退回重提。
 
-`order.id` 是本项目结算订单 ID，`referenceId` 是选填的外部订单号（省略或空字符串表示未填写），`external.timelyOrderId` 是审核通过后关联的履约订单 ID。所有本项目 API 金额均为整数分，时间均为 Unix 毫秒。
+`order.id` 是本项目结算订单 ID，`referenceId` 是选填的外部订单号（省略或空字符串表示未填写），`external.timelyOrderId` 是建单成功后关联的履约订单 ID。所有本项目 API 金额均为整数分，时间均为 Unix 毫秒。
 
 ## 发起方接口
 
@@ -41,7 +41,7 @@
 { "reference": "银行或支付平台流水号", "description": "手动付款说明", "screenshot": { "contentType": "image/png", "data": "原图纯base64内容" } }
 ```
 
-订单变为 `payment.status=submitted`，页面显示待收款确认。只有管理端可以确认收款和审核。
+订单变为 `payment.status=submitted`，页面显示待收款确认。只有管理端可以确认到账。
 
 ## 管理端接口
 
@@ -57,11 +57,11 @@ Content-Type: application/json
 | 方法 | 路径 | 功能 |
 | --- | --- | --- |
 | GET | `/api/order-management/orders` | 管理端查询订单；支持分页、`reviewStatus`、`stage=待报价`、`quoteStatus=pending\|quoted` |
-| GET | `/api/order-management/orders/:id` | 查询订单、付款信息和审核状态 |
+| GET | `/api/order-management/orders/:id` | 查询订单、付款信息和履约进度 |
 | POST | `/api/order-management/orders/:id/quote` | 提交整单报价，待报价订单仅能报价一次 |
-| POST | `/api/order-management/orders/:id/receipt` | 确认实际收款，建议始终携带当前 noteId |
+| POST | `/api/order-management/orders/:id/receipt` | 确认实际到账并自动发起履约建单，建议始终携带当前 noteId |
 | POST | `/api/order-management/orders/:id/reject-payment` | 收款前退回付款资料，必须填写原因，可由原账号重新提交 |
-| POST | `/api/order-management/orders/:id/review` | 审核结果；通过后后台自动发起履约建单 |
+| POST | `/api/order-management/orders/:id/review` | 兼容旧流程中已收款、仍待处理的历史订单 |
 | POST | `/api/order-management/orders/:id/fulfillment` | 写入关联履约订单的状态 |
 | POST | `/api/order-management/orders/:id/link` | 建单结果未确认时，人工核对已有履约订单后关联，避免重复创建 |
 
@@ -73,7 +73,7 @@ Content-Type: application/json
 { "eventId": "quote-20261108-001", "amount": 2468, "note": "报价说明（选填）", "quotedBy": "管理端报价人员" }
 ```
 
-金额使用整数分，范围 1 至 99999999；备注最多 1000 字。管理端桥接层根据登录身份写入 `quotedBy`，后台生成报价时间。成功返回 `{order,replayed}`：`quote` 包含 `status: "quoted"`、`amount`、`note`、`quotedAt`、`quotedBy`，同时更新 `payPrice=amount`。新事件不能覆盖报价；同一事件可重试。报价不确认收款、不提交审核。
+金额使用整数分，范围 1 至 99999999，备注最多 1000 字。管理端桥接层根据登录身份写入 `quotedBy`，后台生成报价时间。成功返回 `{order,replayed}`，其中 `quote` 包含 `status: "quoted"`、`amount`、`note`、`quotedAt`、`quotedBy`，同时更新 `payPrice=amount`。已提交的报价固定，同一事件可重试。
 
 ### 1. 确认实际收款
 
@@ -81,7 +81,7 @@ Content-Type: application/json
 { "eventId": "receipt-20261008-001", "noteId": "当前 payment.noteId", "transactionId": "实际收款流水号", "amount": 2468, "collectedAt": 1791460800000 }
 ```
 
-金额必须等于订单应付金额，同一收款流水不能用于两个订单。`noteId` 提供时必须匹配当前付款资料，并参与事件内容幂等校验。经历过付款资料退回的订单，首次确认必须处于 `submitted` 且携带正确 `noteId`，避免陈旧页面确认新一轮付款；报价订单必须已报价且服务商已提交付款资料。从未退回的历史或兼容模式订单可继续省略 `noteId`、直接确认未提交付款资料的订单。`collectedAt` 表示真实到账时间，可早于提交或重提资料时间，继续沿用原时间格式和未来时间校验。收款后页面显示已收款待审核，此时不调用履约建单接口。
+金额必须等于订单应付金额，同一收款流水不能用于两个订单。`noteId` 提供时必须匹配当前付款资料，并参与事件内容幂等校验。经历过付款资料退回的订单，首次确认必须处于 `submitted` 且携带正确 `noteId`，避免陈旧页面确认新一轮付款。报价订单必须已报价且服务商已提交付款资料。从未退回的历史或兼容模式订单可继续省略 `noteId`、直接确认未提交付款资料的订单。`collectedAt` 表示真实到账时间，可早于提交或重提资料时间。首次确认到账时，同一事务保存 `payment.status=paid`、兼容履约检查的 `review.status=approved` 和唯一建单任务，随后后台自动建单。返回 `external.status=queued` 表示任务已入队，取得履约订单号后更新为 `created`。
 
 ### 1.1 收款前退回付款资料
 
@@ -99,15 +99,15 @@ Content-Type: application/json
 { "previousNoteId": "刚被退回的 payment.noteId", "reference": "付款流水号", "description": "付款说明", "screenshot": { "contentType": "image/png", "data": "原图纯base64内容" } }
 ```
 
-### 2. 审核
+### 2. 历史已收款订单继续建单
 
 ```json
 { "eventId": "review-20261008-001", "status": "approved", "reviewerName": "审核人员", "reviewedAt": 1791460860000, "reason": "核实到账" }
 ```
 
-`status` 为 `approved` 或 `rejected`。拒绝必须填写原因，审核时间不能早于收款时间。审核结果不能直接覆盖。拒绝不会创建履约订单，也不会自动退款或让发起方重复付款。
+该接口只处理旧流程下 `payment.status=paid`、`review.status=pending` 的订单，保留历史调用的 `approved` 和 `rejected` 参数。时间不能早于原收款时间，`rejected` 必须填写原因。管理端的「继续建单」提交 `approved`，显式将该笔订单加入履约队列。原有处理结果保留。
 
-通过后，在事务内建立唯一履约建单任务，返回 `external.status=queued`。后台调用履约系统，成功取得真实 ID 后保存 `external.timelyOrderId`。只返回审核成功不代表已成功创建履约订单。
+后台调用履约系统，成功取得真实 ID 后保存 `external.timelyOrderId`。
 
 ### 3. 履约状态回传
 
@@ -125,7 +125,7 @@ Content-Type: application/json
 { "eventId": "link-001", "timelyOrderId": "已在履约系统核实的订单ID", "description": "建单超时后核实已经成功，不再重复建单" }
 ```
 
-只允许收款并审核通过的订单；不能覆盖已有不同 ID，不能将同一履约订单关联两个结算订单。
+只允许已确认到账且已放行履约的订单。一个履约订单只可关联一个结算订单，已有不同 ID 时返回冲突。
 
 ## 报价上线配置
 
@@ -145,7 +145,7 @@ TIMELY_CREATOR_ID=实际创建人员ID
 
 适配参考 `warehouse_order/src/timelyClient.ts`、`src/auth.ts` 和 warehouse_shop 创建订单代码：向 `POST /admin/timelyOrders/` 发送 `orderInfo` 同类字段，`items` 为 JSON 字符串，商品单价保持分，`payPrice` 由本地分转换为原接口的元；带 appKey/date/SHA256 sign。支持直接返回 `{id:...}` 或 `{data:{id:...}}`，未返回有效 ID 不会标为已建单。
 
-未配置上述参数时不发真实请求，审核通过的任务留在数据库等待配置。目录尚未配置时明确提供测试选项，测试目录订单不会发送至真实履约系统。没有复制旧系统环境或密钥。
+尚未配置履约接口时，已确认到账的建单任务留在数据库等待配置。目录尚未配置时使用测试选项，测试目录订单只用于本地演示。
 
 每个建单请求带稳定的 `Idempotency-Key`。参考旧接口未证明支持幂等，因此默认在失败或请求中断后保留任务供管理端核对，不盲目重发。只有确认履约系统支持此幂等编号后，才设置 `TIMELY_IDEMPOTENCY_SUPPORTED=true`，开启后台自动重试。
 
@@ -181,6 +181,6 @@ GET /api/products?query=关键词&page=1 必须登录。商品统一查询标准
 
 ## 履约状态、备注与配送信息同步
 
-审核建单成功后立即读取现有 `GET /admin/order/:id` 数据接口，后台每 15 秒分批同步已关联订单（每批最多 10 单、并发 2）。发起方和管理端共用数据库中的履约快照；关闭页面后仍继续同步。
+建单成功后立即读取 `GET /admin/order/:id`。后台每 15 秒分批同步已关联订单（每批最多 10 单、并发 2）。发起方和管理端共用数据库中的履约快照，关闭页面后仍继续同步。
 
 `fulfillment` 除进度外，返回 `sourceCode/sourceStatus`、`messages`（配送订单留言）、`memos`（客服备注及时间）、`deliveries`（平台、物流单号、配送状态、配送员姓名电话、取收件信息、配送提示）、`syncedAt`（最近成功同步时间）。读取接口实际的 `memos` 和 `logiticsOrder` / `deliveryLogistics`，只保存所需字段。状态相同仍同步备注及配送变化；相同快照不会重复写进度事件。同步失败保留上次数据并返回 `syncMessage`，后台继续重试。原建单 `messages/contacts` 保留为原始快照。

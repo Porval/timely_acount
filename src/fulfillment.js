@@ -62,7 +62,7 @@ export class FulfillmentDispatcher {
         const row = this.db.prepare("SELECT * FROM fulfillment_jobs WHERE (status IN ('pending','retry') AND next_attempt_at<=?) OR (status='sending' AND lease_until<=?) ORDER BY created_at LIMIT 1").get(now, now);
         if (!row) return null;
         const order = this.orders.get(row.order_id);
-        if (order.payment.status !== 'paid' || order.review.status !== 'approved') throw new Error('未审核订单不能建单');
+        if (order.payment.status !== 'paid' || order.review.status !== 'approved') throw new Error('订单尚未放行履约');
         this.db.prepare("UPDATE fulfillment_jobs SET status='sending', attempts=attempts+1, lease_until=?, updated_at=? WHERE id=?").run(now + 30000, now, row.id);
         order.external = { status: 'creating' }; this.orders.store.write(order, now);
         return row;

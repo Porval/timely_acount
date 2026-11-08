@@ -13,7 +13,7 @@ function fixture(t){
  let tick=Date.parse('2026-10-20T11:00:00Z');
  const accounts=new AccountService({store,sendSms:async()=>{}}),owner=accounts.createAccount({providerName:'测试',personName:'测试人员',mobile:'13800138000'}),orders=new OrderService(store,()=>tick);
  const create=(reference='REF')=>orders.create(owner,{cityId:'city',cityName:'上海',brandId:'brand',brandName:'品牌',plateId:'plate',platformName:'平台',items:[{itemName:'测试商品',spec:'',salesPrice:100,quantity:1}],contacts:'原始收件信息',messages:'原始订单备注',referenceId:reference,payPrice:100,arrivedTime:30},'test-create-'+reference).order;
- const order=create();orders.receipt(order.id,{eventId:'receipt',transactionId:'TX',amount:100,collectedAt:tick});orders.review(order.id,{eventId:'review',status:'approved',reviewerName:'审核人',reviewedAt:tick});orders.link(order.id,{eventId:'link',timelyOrderId:'linked',description:'模拟已关联'});
+ const order=create();orders.receipt(order.id,{eventId:'receipt',transactionId:'TX',amount:100,collectedAt:tick});orders.link(order.id,{eventId:'link',timelyOrderId:'linked',description:'模拟已关联'});
  t.after(()=>{store.close();rmSync(dir,{recursive:true,force:true})});
  return {store,orders,order,path,owner,create,advance:(milliseconds=15000)=>{tick+=milliseconds}};
 }
