@@ -183,12 +183,16 @@ export class OrderService {
         if (!previousNoteId || previousNoteId !== expected) fail(409, '付款资料已更新，请刷新订单后重新提交');
       } else if (previousNoteId !== undefined) fail(409, '付款资料版本不匹配，请刷新订单后重新提交');
       const image = parseScreenshot(input.screenshot);
-      if (order.payment.status === 'submitted' && ((order.payment.reference ?? '') !== payload.reference || (order.payment.description ?? '') !== payload.description || (order.payment.screenshot && order.payment.screenshot.sha256 !== image.sha256))) fail(409, '已提交付款信息，等待管理端核对');
-      if (order.payment.status === 'submitted' && order.payment.screenshot) return { order, replayed: true };
+      const supplement = order.payment.status === 'submitted';
+      if (supplement) {
+        const savedReference = typeof order.payment.reference === 'string' ? order.payment.reference.trim() : order.payment.reference ?? '';
+        if (savedReference !== payload.reference || (order.payment.description ?? '') !== payload.description ||
+            (order.payment.screenshot && order.payment.screenshot.sha256 !== image.sha256)) fail(409, '已提交付款信息，等待管理端核对');
+        if (order.payment.screenshot) return { order, replayed: true };
+      }
       const now = this.now();
       const screenshot = {id:randomUUID(),contentType:image.contentType,size:image.size,sha256:image.sha256,uploadedAt:now};
       this.db.prepare('INSERT INTO payment_screenshots(id,order_id,content_type,sha256,data,created_at) VALUES(?,?,?,?,?,?)').run(screenshot.id,id,image.contentType,image.sha256,image.data,now);
-      const supplement = order.payment.status === 'submitted';
       order.payment = { ...order.payment, status: 'submitted', noteId: supplement ? order.payment.noteId || randomUUID() : randomUUID(), ...payload, screenshot,
         submittedAt: supplement ? order.payment.submittedAt || now : now, payerId: account.id, payerName: account.personName,
         ...(hasRejections ? { previousNoteId } : {}) };

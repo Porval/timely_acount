@@ -7,6 +7,7 @@ const timelinePhases = new Map([
 ]);
 const fulfillmentPrefix = '履约状态：';
 const createdEvents = new Set(['履约订单创建成功', '管理端核对履约订单后关联']);
+const paymentEvents = new Set(['补充付款截图', '重新提交付款资料', '提交手动付款信息']);
 
 function providerDelivery({ id, channel, orderNo, riderName, riderPhone, status }) {
   const selfDelivery = status === '自配送' && (!channel || channel === '配送平台');
@@ -26,7 +27,12 @@ export function providerOrder(order) {
     } else if (createdEvents.has(event.title)) {
       eventPhase = 0;
     } else {
-      if (event.title !== '履约信息已更新') events.push(event);
+      if (event.title === '履约信息已更新') continue;
+      if (paymentEvents.has(event.title) && typeof event.description === 'string') {
+        events.push({ ...event, description: event.description.replace('提交付款流水和截图', '提交付款资料') });
+      } else {
+        events.push(event);
+      }
       continue;
     }
     if (eventPhase === undefined || eventPhase <= latestPhase || eventPhase > phase) continue;

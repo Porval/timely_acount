@@ -115,7 +115,9 @@ test('服务商申请、履约标识与最终发起退款分开落库，支持�
   assert.equal(applied.data.order.refund.status, 'requested');
   assert.equal(applied.data.order.fulfillment.status, 'waiting');
   assert.equal(Object.hasOwn(applied.data.order.fulfillment, 'sourceCode'), false);
-  assert.equal((await submit(f.cookie, 'refund-request', '不再需要')).data.order.refund.id, refundId);
+  const reapplied = await submit(f.cookie, 'refund-request', '不再需要');
+  assert.equal(reapplied.data.order.refund.id, refundId);
+  assert.deepEqual(reapplied.data.order.fulfillment, applied.data.order.fulfillment);
   assert.equal((await submit(f.cookie, 'refund-request', '变更原因')).status, 409);
   assert.equal((await submit(f.cookie, 'new-refund-request', '不再需要')).status, 409);
   assert.equal((await f.call(path, { cookie: f.cookie })).data.canRequestRefund, false);
@@ -519,6 +521,8 @@ test('服务商各响应只展示四段履约进度，管理端保留完整快�
   ]);
   let now = Date.now() + 10;
   const sync = new OrderService(f.store, () => now);
+  sync.syncFulfillment(order.id, { ...snapshot, id: 'linked', status: 7 });
+  now += 10;
   sync.syncFulfillment(order.id, { ...snapshot, id: 'linked', status: 4 });
   const deliveryTime = now;
   now += 10;
@@ -551,6 +555,7 @@ test('服务商各响应只展示四段履约进度，管理端保留完整快�
   assert.deepEqual(completed.fulfillment, { status: 'delivered', updatedAt: now });
   assert.deepEqual(publicTimeline(completed).map(event => event.title), ['履约状态：待接单', '履约状态：已接单', '履约状态：配送中', '履约状态：已完成']);
   assert.equal(publicTimeline(completed)[2].time, deliveryTime);
+  assert.equal(publicTimeline(completed)[1].time, publicTimeline(accepted)[1].time);
 });
 
 test('无须录入到账时间即可确认到账、幂等建单并同步首份配送快照',async t=>{
