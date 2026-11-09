@@ -1,5 +1,6 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { OrderService } from './order-service.js';
+import { providerOrder } from './provider-order.js';
 import { ChannelService } from './channel-service.js';
 import { RefundService } from './refund-service.js';
 import { FulfillmentDispatcher, createFulfillmentClient } from './fulfillment.js';
@@ -19,6 +20,7 @@ const json = (response, status, body) => {
   response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
   response.end(JSON.stringify(body));
 };
+const providerOrderResult = result => ({ ...result, order: providerOrder(result.order) });
 async function body(request, limit = 16384) {
   if (!(request.headers['content-type'] || '').toLowerCase().startsWith('application/json')) throw new AppError(415, '请求需使用 application/json');
   let data = '';
@@ -161,19 +163,26 @@ export function createApp({ config = loadConfig(), store = new SQLiteStore(confi
       if (path === '/api/orders' || /^\/api\/orders\/[^/]+(?:\/(?:manual-payment|payment-screenshot|refund-request))?$/.test(path)) {
         const account = service.authenticate(cookieToken(request));
         if (request.method === 'GET' && path.endsWith('/payment-screenshot')) return sendScreenshot(response, orders.getPaymentScreenshot(path.split('/').at(-2), account.id));
-        if (request.method === 'POST' && path.endsWith('/manual-payment')) return json(response, 200, orders.submitManualPayment(path.split('/').at(-2), account, await body(request, 8 * 1024 * 1024)));
-        if (request.method === 'POST' && path.endsWith('/refund-request')) {
-          return json(response, 200, refunds.request(path.split('/').at(-2), account, await body(request), request.headers['idempotency-key']));
+        if (request.method === 'POST' && path.endsWith('/manual-payment')) {
+          const result = orders.submitManualPayment(path.split('/').at(-2), account, await body(request, 8 * 1024 * 1024));
+          return json(response, 200, providerOrderResult(result));
         }
-        if (request.method === 'GET' && path === '/api/orders') return json(response, 200, { ...orders.list(account.id, Object.fromEntries(url.searchParams)), requiresQuote });
+        if (request.method === 'POST' && path.endsWith('/refund-request')) {
+          const result = refunds.request(path.split('/').at(-2), account, await body(request), request.headers['idempotency-key']);
+          return json(response, 200, providerOrderResult(result));
+        }
+        if (request.method === 'GET' && path === '/api/orders') {
+          const result = orders.list(account.id, Object.fromEntries(url.searchParams));
+          return json(response, 200, { ...result, orders: result.orders.map(providerOrder), requiresQuote });
+        }
         if (request.method === 'POST' && path === '/api/orders') {
           const result = orders.create(account, await body(request, 65536), request.headers['idempotency-key']);
-          return json(response, result.created ? 201 : 200, result);
+          return json(response, result.created ? 201 : 200, providerOrderResult(result));
         }
         if (request.method === 'GET') {
           let order = orders.get(path.split('/').at(-1), account.id);
           order = await synchronizer.refresh(order.id);
-          return json(response, 200, { order, canRequestRefund: refunds.canRequest(order) });
+          return json(response, 200, providerOrderResult({ order, canRequestRefund: refunds.canRequest(order) }));
         }
         throw new AppError(405, '发起方只能创建和查询订单');
       }

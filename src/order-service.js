@@ -111,9 +111,9 @@ export class OrderService {
         WHEN json_extract(data,'$.review.status')='rejected' THEN '审核未通过'
         WHEN json_extract(data,'$.review.status')!='approved' THEN '已收款待审核'
         WHEN json_extract(data,'$.external.status')!='created' THEN '审核通过待建单'
-        WHEN json_extract(data,'$.fulfillment.sourceCode')=6 THEN '已退款'
+        ${ownerId ? '' : `WHEN json_extract(data,'$.fulfillment.sourceCode')=6 THEN '已退款'
         WHEN json_extract(data,'$.fulfillment.sourceCode')=8 OR json_extract(data,'$.fulfillment.errorOrder')=1 THEN '履约异常'
-        WHEN json_extract(data,'$.fulfillment.hungup')=1 THEN '已挂起'
+        WHEN json_extract(data,'$.fulfillment.hungup')=1 THEN '已挂起'`}
         WHEN json_extract(data,'$.fulfillment.status')='delivered' THEN '已完成'
         WHEN json_extract(data,'$.fulfillment.status')='delivering' THEN '配送中'
         WHEN json_extract(data,'$.fulfillment.status')='accepted' THEN '已接单'
@@ -170,7 +170,8 @@ export class OrderService {
     return screenshot;
   }
   submitManualPayment(id, account, input) {
-    const payload = { reference: text(input.reference, '付款流水号', 120), description: text(input.description, '付款说明', 1000, true) };
+    const reference = typeof input.reference === 'string' ? input.reference.trim() : input.reference;
+    const payload = { reference: text(reference, '付款流水号', 120, true), description: text(input.description, '付款说明', 1000, true) };
     const previousNoteId = input.previousNoteId === undefined ? undefined : text(input.previousNoteId, 'previousNoteId', 120);
     return this.store.transaction(() => {
       const order = this.get(id, account.id);
@@ -182,7 +183,7 @@ export class OrderService {
         if (!previousNoteId || previousNoteId !== expected) fail(409, '付款资料已更新，请刷新订单后重新提交');
       } else if (previousNoteId !== undefined) fail(409, '付款资料版本不匹配，请刷新订单后重新提交');
       const image = parseScreenshot(input.screenshot);
-      if (order.payment.status === 'submitted' && (order.payment.reference !== payload.reference || order.payment.description !== payload.description || (order.payment.screenshot && order.payment.screenshot.sha256 !== image.sha256))) fail(409, '已提交付款信息，等待管理端核对');
+      if (order.payment.status === 'submitted' && ((order.payment.reference ?? '') !== payload.reference || (order.payment.description ?? '') !== payload.description || (order.payment.screenshot && order.payment.screenshot.sha256 !== image.sha256))) fail(409, '已提交付款信息，等待管理端核对');
       if (order.payment.status === 'submitted' && order.payment.screenshot) return { order, replayed: true };
       const now = this.now();
       const screenshot = {id:randomUUID(),contentType:image.contentType,size:image.size,sha256:image.sha256,uploadedAt:now};
@@ -192,7 +193,7 @@ export class OrderService {
         submittedAt: supplement ? order.payment.submittedAt || now : now, payerId: account.id, payerName: account.personName,
         ...(hasRejections ? { previousNoteId } : {}) };
       delete order.payment.rejection;
-      this.event(order, supplement ? '补充付款截图' : hasRejections ? '重新提交付款资料' : '提交手动付款信息', `${account.personName} 提交付款流水和截图，等待管理端核对到账。`);
+      this.event(order, supplement ? '补充付款截图' : hasRejections ? '重新提交付款资料' : '提交手动付款信息', `${account.personName} 提交付款资料，等待管理端核对到账。`);
       this.store.write(order, now);
       return { order, replayed: false };
     });

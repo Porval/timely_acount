@@ -103,6 +103,7 @@ test('服务商申请、履约标识与最终发起退款分开落库，支持�
   f.orders.link(order.id, { eventId: 'refund-link', timelyOrderId: 'refund-linked', description: '测试关联' });
   f.orders.syncFulfillment(order.id, { id: 'refund-linked', status: 6 });
   const prior = (await f.call(path, { cookie: f.cookie })).data;
+  const priorFulfillment = f.orders.get(order.id).fulfillment;
   assert.equal(prior.canRequestRefund, true);
   const otherCookie = await f.login(f.other);
   assert.equal((await submit(otherCookie, 'refund-request', '越权')).status, 404);
@@ -112,6 +113,8 @@ test('服务商申请、履约标识与最终发起退款分开落库，支持�
   assert.equal(applied.status, 200);
   const refundId = applied.data.order.refund.id;
   assert.equal(applied.data.order.refund.status, 'requested');
+  assert.equal(applied.data.order.fulfillment.status, 'waiting');
+  assert.equal(Object.hasOwn(applied.data.order.fulfillment, 'sourceCode'), false);
   assert.equal((await submit(f.cookie, 'refund-request', '不再需要')).data.order.refund.id, refundId);
   assert.equal((await submit(f.cookie, 'refund-request', '变更原因')).status, 409);
   assert.equal((await submit(f.cookie, 'new-refund-request', '不再需要')).status, 409);
@@ -165,7 +168,7 @@ test('服务商申请、履约标识与最终发起退款分开落库，支持�
   assert.deepEqual(initiated.data.order.payment, prior.order.payment);
   assert.deepEqual(initiated.data.order.review, prior.order.review);
   assert.deepEqual(initiated.data.order.external, prior.order.external);
-  assert.deepEqual(initiated.data.order.fulfillment, prior.order.fulfillment);
+  assert.deepEqual(initiated.data.order.fulfillment, priorFulfillment);
   assert.equal(initiated.data.order.events.filter(event => event.title === '申请退款').length, 1);
   assert.equal(initiated.data.order.events.filter(event => event.title === '履约已确认退款标识').length, 1);
   assert.equal(initiated.data.order.events.filter(event => event.title === '已发起退款').length, 1);
@@ -381,6 +384,31 @@ test('付款截图必填、真实类型校验、二进制持久化与账号访�
   const reopened=new SQLiteStore(f.store.path);t.after(()=>reopened.close());
   assert.deepEqual(new OrderService(reopened).getPaymentScreenshot(order.id,f.owner.id).data,Buffer.from(screenshot.data,'base64'));
 });
+test('服务商付款流水号可省略，空白重试幂等，管理端到账流水仍必填', async t => {
+  const f = await fixture(t);
+  const order = (await f.create()).data.order;
+  const pay = body => f.call('/api/orders/' + order.id + '/manual-payment', { method: 'POST', cookie: f.cookie, body });
+  assert.equal((await pay({})).status, 400);
+  for (const reference of [null, 123, 'x'.repeat(121)]) assert.equal((await pay({ reference, screenshot })).status, 400);
+  const submitted = await pay({ screenshot });
+  assert.equal(submitted.status, 200);
+  assert.equal(submitted.data.order.payment.reference, '');
+  assert.match(submitted.data.order.events.at(-1).description, /提交付款资料/);
+  for (const reference of ['', '  \n ']) {
+    const retried = await pay({ reference, screenshot });
+    assert.equal(retried.data.replayed, true);
+    assert.deepEqual(retried.data.order.payment, submitted.data.order.payment);
+  }
+  assert.equal((await pay({ reference: 'changed', screenshot })).status, 409);
+  assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM payment_screenshots').get().n, 1);
+  const receipt = body => f.call('/api/order-management/orders/' + order.id + '/receipt', { method: 'POST', management: true, body });
+  const evidence = { eventId: 'optional-ref-receipt', amount: 2468, noteId: submitted.data.order.payment.noteId };
+  assert.equal((await receipt(evidence)).status, 400);
+  const paid = await receipt({ ...evidence, transactionId: 'ADMIN-TRANSACTION' });
+  assert.equal(paid.status, 200);
+  assert.equal(paid.data.order.payment.reference, '');
+  assert.equal(paid.data.order.payment.transactionId, 'ADMIN-TRANSACTION');
+});
 test('旧付款可补截图，已提交凭证不可替换，商品 UPC 快照保留',async t=>{
   const f=await fixture(t),order=(await f.create({...input(),items:[{...input().items[0],upc:'194841070138',catalogId:'standard-item'}]})).data.order;
   assert.equal(order.items[0].upc,'194841070138');
@@ -456,14 +484,73 @@ test('履约建单传递商品图片快照，手工商品仍可无图',async()=>
   assert.deepEqual(JSON.parse(sent.items),items);
 });
 
-test('服务商与管理端接口均返回同步的备注配送信息，其他账号不能触发或读取',async t=>{
- let queries=0;const client=async()=> 'linked';client.query=async id=>{queries++;return {id,status:3,memos:[{id:'memo',content:'已安排配送'}],logiticsOrder:{id:'delivery',channel:1,status:2,deliverier:'测试配送员',mobile:'13800138000',logiticsOrderId:'TRACK-001'}}};
- const f=await fixture(t,{},client),order=(await f.create()).data.order;
- f.orders.receipt(order.id,{eventId:'sync-receipt',transactionId:'SYNC-TX',amount:2468,collectedAt:Date.now()});f.orders.link(order.id,{eventId:'sync-link',timelyOrderId:'linked',description:'模拟履约关联'});
- const other=await f.login(f.other);assert.equal((await f.call(`/api/orders/${order.id}`,{cookie:other})).status,404);assert.equal(queries,0);
- const detail=await f.call(`/api/orders/${order.id}`,{cookie:f.cookie});assert.equal(detail.status,200);assert.equal(detail.data.order.fulfillment.memos[0].content,'已安排配送');assert.equal(detail.data.order.fulfillment.deliveries[0].riderPhone,'13800138000');assert.equal(queries,1);
- const manager=await f.call('/api/order-management/orders',{management:true});assert.equal(manager.data.orders[0].fulfillment.deliveries[0].orderNo,'TRACK-001');
- assert.equal((await f.call('/api/orders',{cookie:f.cookie})).data.orders[0].fulfillment.sourceStatus,'已呼叫跑腿');
+test('服务商各响应只展示四段履约进度，管理端保留完整快照', async t => {
+  const snapshot = {
+    status: 3, messages: '内部配送备注', memos: [{ id: 'memo', content: '内部客服备注' }],
+    logiticsOrder: [
+      { id: 'delivery', channel: 1, status: 3, deliverier: '测试配送员', mobile: '13800138000', logiticsOrderId: 'TRACK-001', fromDetailAddress: '内部取件地址', toDetailAddress: '内部收件地址', deliveryTips: '内部配送提示' },
+      { id: 'self', status: 7 },
+    ],
+  };
+  let queries = 0;
+  const client = async () => 'linked';
+  client.query = async id => { queries++; return { id, ...snapshot }; };
+  const f = await fixture(t, {}, client);
+  const order = (await f.create()).data.order;
+  assert.deepEqual(order.fulfillment, { status: 'not_started' });
+  f.orders.receipt(order.id, { eventId: 'sync-receipt', transactionId: 'SYNC-TX', amount: 2468 });
+  f.orders.link(order.id, { eventId: 'sync-link', timelyOrderId: 'linked', description: '内部关联说明' });
+  const path = '/api/orders/' + order.id;
+  const getMember = url => f.call(url, { cookie: f.cookie });
+  const getManager = url => f.call(url, { management: true });
+  const other = await f.login(f.other);
+  assert.equal((await f.call(path, { cookie: other })).status, 404);
+  assert.equal(queries, 0);
+
+  const accepted = (await getMember(path)).data.order;
+  assert.equal(queries, 1);
+  assert.equal(accepted.fulfillment.status, 'accepted');
+  assert.equal(Object.hasOwn(accepted.fulfillment, 'deliveries'), false);
+  const originalHistory = f.orders.get(order.id).events;
+  const publicTimeline = row => row.events.filter(event => event.title.startsWith('履约状态：'));
+  assert.deepEqual(publicTimeline(accepted), [
+    { ...originalHistory.at(-2), title: '履约状态：待接单', description: '' },
+    { ...originalHistory.at(-1), title: '履约状态：已接单', description: '' },
+  ]);
+  let now = Date.now() + 10;
+  const sync = new OrderService(f.store, () => now);
+  sync.syncFulfillment(order.id, { ...snapshot, id: 'linked', status: 4 });
+  const deliveryTime = now;
+  now += 10;
+  sync.syncFulfillment(order.id, { ...snapshot, id: 'linked', status: 8, errorDesc: '内部错误' });
+  const publicDelivery = {
+    status: 'delivering', updatedAt: deliveryTime,
+    deliveries: [
+      { id: 'delivery', channel: '闪送', orderNo: 'TRACK-001', riderName: '测试配送员', riderPhone: '13800138000' },
+      { id: 'self', channel: '自配送', orderNo: '', riderName: '', riderPhone: '' },
+    ],
+  };
+  const memberList = (await getMember('/api/orders?stage=配送中')).data;
+  assert.equal(memberList.total, 1);
+  assert.deepEqual(memberList.orders[0].fulfillment, publicDelivery);
+  assert.equal((await getMember('/api/orders?stage=履约异常')).data.total, 0);
+  const raw = (await getManager('/api/order-management/orders?stage=履约异常')).data;
+  assert.equal(raw.total, 1);
+  assert.equal(raw.orders[0].fulfillment.sourceStatus, '履约异常');
+  assert.equal(raw.orders[0].fulfillment.memos[0].content, '内部客服备注');
+  assert.equal(raw.orders[0].fulfillment.deliveries[0].fromAddress, '内部取件地址');
+
+  const replay = await f.create();
+  assert.equal(replay.data.created, false);
+  assert.deepEqual(replay.data.order.fulfillment, publicDelivery);
+  assert.equal(JSON.stringify(replay.data.order).includes('内部'), false);
+  assert.ok(replay.data.order.events.some(event => event.title === '确认收款'));
+  now += 10;
+  sync.syncFulfillment(order.id, { ...snapshot, id: 'linked', status: 5 });
+  const completed = (await getMember(path)).data.order;
+  assert.deepEqual(completed.fulfillment, { status: 'delivered', updatedAt: now });
+  assert.deepEqual(publicTimeline(completed).map(event => event.title), ['履约状态：待接单', '履约状态：已接单', '履约状态：配送中', '履约状态：已完成']);
+  assert.equal(publicTimeline(completed)[2].time, deliveryTime);
 });
 
 test('无须录入到账时间即可确认到账、幂等建单并同步首份配送快照',async t=>{
@@ -605,6 +692,7 @@ test('确认与退回同一付款资料并发时只有一个决策成功，只�
 test('旧补图保持本轮noteId和提交时间，未退回旧收款接口兼容但可选noteId仍校验',async t=>{
   const f=await fixture(t),order=(await f.create()).data.order,submittedAt=Date.now()-1000;
   order.payment={status:'submitted',noteId:'legacy-payment',reference:'LEGACY-PROOF',description:'',submittedAt};f.orders.store.write(order,Date.now());
+  assert.throws(() => f.orders.submitManualPayment(order.id, f.owner, { screenshot }), /已提交付款信息/);
   const supplemented=f.orders.submitManualPayment(order.id,f.owner,{reference:'LEGACY-PROOF',description:'',screenshot}).order.payment;
   assert.equal(supplemented.noteId,'legacy-payment');assert.equal(supplemented.submittedAt,submittedAt);
   const receipt={eventId:'legacy-receipt',transactionId:'LEGACY-TX',amount:2468,collectedAt:Date.now()};
@@ -612,6 +700,13 @@ test('旧补图保持本轮noteId和提交时间，未退回旧收款接口兼�
   assert.equal(f.orders.receipt(order.id,receipt).order.payment.status,'paid');assert.equal(f.orders.receipt(order.id,receipt).replayed,true);
   const second=(await f.create({...input(),referenceId:'LEGACY-UNPAID'},'legacy-unpaid')).data.order;
   assert.equal(f.orders.receipt(second.id,{...receipt,eventId:'legacy-direct',transactionId:'LEGACY-DIRECT'}).order.payment.status,'paid');
+  const blank = (await f.create({ ...input(), referenceId: 'LEGACY-BLANK' }, 'legacy-blank')).data.order;
+  blank.payment = { status: 'submitted', noteId: 'legacy-no-reference', submittedAt };
+  f.orders.store.write(blank, Date.now());
+  const supplementedBlank = f.orders.submitManualPayment(blank.id, f.owner, { screenshot }).order.payment;
+  assert.equal(supplementedBlank.reference, '');
+  assert.equal(supplementedBlank.noteId, blank.payment.noteId);
+  assert.equal(supplementedBlank.submittedAt, submittedAt);
 });
 
 test('旧一单一图迁移保留BLOB和审计，允许一单多次提交，重复迁移安全且约束仍在',t=>{

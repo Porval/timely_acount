@@ -38,10 +38,10 @@
 提交手动付款信息（待报价订单返回 409）：
 
 ```json
-{ "reference": "银行或支付平台流水号", "description": "手动付款说明", "screenshot": { "contentType": "image/png", "data": "原图纯base64内容" } }
+{ "description": "手动付款说明", "screenshot": { "contentType": "image/png", "data": "原图纯base64内容" } }
 ```
 
-订单变为 `payment.status=submitted`，页面显示「付款待审核」。管理员核实到账后确认，系统自动建单。
+付款截图必填。服务商的 `reference` 为选填，省略或留空时保存为空字符串，填写时最长 120 字。订单变为 `payment.status=submitted`，页面显示「付款待审核」。管理员核实到账后填写独立的 `transactionId` 并确认，系统自动建单。
 
 订单列表可按 `stage=付款待审核`、`待接单`、`已接单`、`配送中`、`已完成` 查询。旧版的 `待收款确认` 和 `待履约` 分别对应 `付款待审核` 和 `待接单`，`履约中` 包含 `已接单` 和 `配送中`。
 
@@ -118,7 +118,7 @@ Content-Type: application/json
 
 退回后 `payment.status=unpaid`，`review.status` 仍为 `not_submitted`；这只是要求原建单账号重新确认付款资料，不确认到账、不发起退款，也不会建立履约任务。`payment.rejection` 返回当前退回的 `{noteId,reason,reviewerName,rejectedAt}`；`payment.rejections[]` 追加保留每轮被退回的流水、说明、截图元信息、提交时间、提交人和拒绝结果，进度事件保留操作记录。
 
-原账号重新提交 `POST /api/orders/:id/manual-payment` 时，必须额外提供 `previousNoteId`，等于刚被退回的 `payment.noteId`，其余付款字段和截图仍必填。可重新确认相同流水和原图，无需为了重提刻意修改内容。成功后生成新的 `noteId/submittedAt`，清除当前 `payment.rejection` 并保留完整 `rejections`，同时在本轮付款中保存 `previousNoteId`。网络重试必须保留相同 `previousNoteId` 和内容；待确认期间重复相同请求返回 `replayed:true`，旧轮次的提交、确认或退回请求不能改变新资料。初次提交、未退回旧订单补图仍可省略 `previousNoteId`；补图保留本轮已有的 `noteId/submittedAt`。
+原账号重新提交 `POST /api/orders/:id/manual-payment` 时，必须提供刚被退回的 `payment.noteId` 作为 `previousNoteId`，并上传付款截图。可重新确认相同流水和原图。成功后生成新的 `noteId/submittedAt`，清除当前 `payment.rejection` 并保留完整 `rejections`，同时在本轮付款中保存 `previousNoteId`。待确认期间以相同 `previousNoteId` 和内容重试返回 `replayed:true`。初次提交和未退回的旧订单补图可省略 `previousNoteId`。旧资料补图时须匹配原来的付款流水和说明，已有的 `noteId/submittedAt` 继续保留。
 
 ```json
 { "previousNoteId": "刚被退回的 payment.noteId", "reference": "付款流水号", "description": "付款说明", "screenshot": { "contentType": "image/png", "data": "原图纯base64内容" } }
@@ -212,4 +212,6 @@ POST /api/orders/:id/manual-payment 新增必填 screenshot：{contentType: 'ima
 
 建单成功后立即读取 `GET /admin/order/:id`。后台每 15 秒分批同步已关联订单（每批最多 10 单、并发 2）。发起方和管理端共用数据库中的履约快照，关闭页面后仍继续同步。
 
-`fulfillment` 除进度外，返回 `sourceCode/sourceStatus`、`messages`（配送订单留言）、`memos`（客服备注及时间）、`deliveries`（平台、物流单号、配送状态、配送员姓名电话、取收件信息、配送提示）、`syncedAt`（最近成功同步时间）。读取接口实际的 `memos` 和 `logiticsOrder` / `deliveryLogistics`，只保存所需字段。状态相同仍同步备注及配送变化；相同快照不会重复写进度事件。同步失败保留上次数据并返回 `syncMessage`，后台继续重试。原建单 `messages/contacts` 保留为原始快照。
+服务商的订单列表、详情和操作响应统一返回公开履约进度 `waiting`（待接单）、`accepted`（已接单）、`delivering`（配送中）、`delivered`（已完成）。履约开始前为 `not_started`。时间线显示各阶段里程碑和原有的业务操作，`fulfillment.updatedAt` 是最新公开里程碑的时间。配送中可查看 `deliveries`，每条包含 `id`、`channel`、`orderNo`、`riderName` 和 `riderPhone`。退款处理单独显示在 `refund`。
+
+管理端继续读取完整履约快照，包括 `sourceCode/sourceStatus`、`messages`（配送订单留言）、`memos`（客服备注及时间）、`deliveries`（平台、物流单号、配送状态、配送员姓名电话、取收件信息、配送提示）和 `syncedAt`（最近成功同步时间）。同步读取履约接口的 `memos` 和 `logiticsOrder` / `deliveryLogistics`。状态相同仍同步备注及配送变化。同步失败保留上次数据并返回 `syncMessage`，后台继续重试。原建单 `messages/contacts` 保存订单发起时的资料。
